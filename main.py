@@ -19,6 +19,19 @@ CLIENT_SECRET = os.environ.get('PROKERALA_CLIENT_SECRET')
 FINNHUB_KEY = os.environ.get('FINNHUB_API_KEY')
 AYANAMSA_MODE = 1 
 
+# --- EOD SECTOR MAPPING ---
+NSE_SECTOR_MAP = {
+    "☀️ PSU": "^CNXPSUBANK",    
+    "🌙 FMCG": "^CNXFMCG",       
+    "⚔️ Infra": "^CNXINFRA",     
+    "💻 IT": "^CNXIT",         
+    "🏦 Banking": "^NSEBANK", 
+    "💎 Auto": "^CNXAUTO",       
+    "⚒️ Metals": "^CNXMETAL",   
+    "🚀 Tech": "^CNXIT",         
+    "💊 Pharma": "^CNXPHARMA"    
+}
+
 finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
 
 def get_prokerala_token():
@@ -28,12 +41,9 @@ def get_prokerala_token():
     return response.json().get('access_token')
 
 def log_prediction(sector_map):
-    """Saves 4 and 5 star predictions for weekend review."""
     file_path = 'backtest_log.csv'
     today = datetime.datetime.now().strftime('%Y-%m-%d')
-    # Filter for high conviction only
     top_picks = [s for s, stars in sector_map.items() if stars >= 4]
-    
     file_exists = os.path.isfile(file_path)
     with open(file_path, mode='a', newline='') as f:
         writer = csv.writer(f)
@@ -65,12 +75,31 @@ def get_vedic_data(token):
     headers = {'Authorization': f'Bearer {token}'}
     return requests.get(url, params=params, headers=headers).json()
 
+def calculate_eod_performance():
+    """Fetches daily % change for verification."""
+    try:
+        tickers = list(NSE_SECTOR_MAP.values())
+        # We use a 2-day period to ensure we have the previous close for pct_change
+        data = yf.download(tickers, period="2d", interval="1d", progress=False)
+        eod_msg = "📊 *EOD Market Verification* 📊\n"
+        eod_msg += f"📅 {datetime.datetime.now().strftime('%d %b %Y')}\n\n"
+        
+        for sector_name, ticker in NSE_SECTOR_MAP.items():
+            if ticker in data['Close']:
+                prices = data['Close'][ticker]
+                if len(prices) >= 2:
+                    pct = ((prices.iloc[-1] - prices.iloc[-2]) / prices.iloc[-2]) * 100
+                    emoji = "📈" if pct > 0 else "📉"
+                    eod_msg += f"{emoji} {sector_name}: {pct:+.2f}%\n"
+        return eod_msg
+    except Exception as e:
+        return f"EOD Verification Error: {e}"
+
 def generate_ultimate_report(vedic, rsi, vix, sentiment):
     inner = vedic.get('data', {})
     tithi = inner.get('tithi', [{}])[0].get('name', 'N/A')
     nakshatra = inner.get('nakshatra', [{}])[0].get('name', 'N/A')
     
-    # Time Windows
     rk = inner.get('rahu_kaal', [{}])[0]
     rahu_window = f"{rk.get('start')[11:16]} - {rk.get('end')[11:16]}"
     
@@ -80,7 +109,6 @@ def generate_ultimate_report(vedic, rsi, vix, sentiment):
             abhijit_window = f"{m.get('start')[11:16]} - {m.get('end')[11:16]}"
             break
 
-    # 9-Sector Logic
     planets_info = inner.get('planetary_strength', {}).get('planets', [])
     strength_map = {p['name']: p.get('shadbala', {}).get('ratio', 1.0) for p in planets_info}
 
@@ -99,9 +127,7 @@ def generate_ultimate_report(vedic, rsi, vix, sentiment):
         "💊 Pharma": calc_stars("Ketu")
     }
     
-    # --- LOGGING FOR BACKTEST ---
     log_prediction(sector_map)
-    
     heatmap = "\n".join([f"{k}: {'⭐' * v}" for k, v in sector_map.items()])
 
     report = (
@@ -123,6 +149,7 @@ def generate_ultimate_report(vedic, rsi, vix, sentiment):
 
 def main():
     try:
+        # 1. MORNING REPORT
         token = get_prokerala_token()
         rsi, vix, sentiment = get_market_intelligence()
         vedic = get_vedic_data(token)
@@ -130,6 +157,11 @@ def main():
         
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": report, "parse_mode": "Markdown"})
+        
+        # 2. EOD REPORT (Trigger manually or via separate scheduled task)
+        # eod_report = calculate_eod_performance()
+        # requests.post(url, data={"chat_id": CHAT_ID, "text": eod_report, "parse_mode": "Markdown"})
+
     except Exception as e:
         print(f"Error: {e}")
 
