@@ -137,6 +137,16 @@ def generate_ultimate_report(vedic, rsi, vix, sentiment):
             rahu_window = f"{rahu_data[0]['start'][11:16]} - {rahu_data[0]['end'][11:16]}"
         except: pass
 
+    abhijit_window = "N/A"
+    for m in inner.get('muhurta', []):
+        if m.get('name') == 'Abhijit':
+            abhijit_window = f"{m.get('start')[11:16]} - {m.get('end')[11:16]}"
+            break
+
+    # Fix: Define strength_map BEFORE the function that uses it
+    planets_info = inner.get('planetary_strength', {}).get('planets', [])
+    strength_map = {p['name']: p.get('shadbala', {}).get('ratio', 1.0) for p in planets_info}
+
     def calc_stars(planet_name):
         ratio = strength_map.get(planet_name, 1.0)
         score = 3
