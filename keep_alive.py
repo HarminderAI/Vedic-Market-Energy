@@ -1,31 +1,33 @@
 from flask import Flask, request
 from threading import Thread
-import main # Import your main script logic
 
 app = Flask('')
 
+# This variable will store the EOD function passed from main.py
+eod_trigger_func = None
+
 @app.route('/')
 def home():
-    # Check if the URL is hit with ?mode=eod
+    # Detect the ?mode=eod parameter
     mode = request.args.get('mode')
     
-    if mode == 'eod':
-        # Trigger the EOD logic directly
-        eod_report = main.calculate_eod_performance()
-        main.send_telegram_msg(eod_report)
-        return "EOD Verification Sent!", 200
+    if mode == 'eod' and eod_trigger_func:
+        # Execute the function passed from main.py
+        eod_trigger_func()
+        return "EOD Verification Triggered and Sent!", 200
     
-    # Check if hit with ?mode=morning (Optional, for manual triggers)
-    if mode == 'morning':
-        main.main()
-        return "Morning Report Sent!", 200
-
-    # Default heartbeat response for Render
-    return "Vedic Bot is Alive!", 200
+    return "Vedic Bot Heartbeat: Active", 200
 
 def run():
+    # Port 10000 is standard for Render
     app.run(host='0.0.0.0', port=10000)
 
-def keep_alive():
+def keep_alive(callback):
+    """
+    Starts the web server and accepts a callback function 
+    to handle EOD logic without circular imports.
+    """
+    global eod_trigger_func
+    eod_trigger_func = callback
     t = Thread(target=run)
     t.start()
