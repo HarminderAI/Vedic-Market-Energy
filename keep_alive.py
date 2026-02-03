@@ -1,5 +1,6 @@
 from flask import Flask
 from threading import Thread
+import os  # <--- THIS WAS MISSING!
 
 app = Flask('')
 
@@ -8,7 +9,7 @@ def home():
     return "Vedic Bot is Awake!"
 
 def run():
-    # Render uses a dynamic port; this line auto-detects it
+    # Render needs to know which port to use
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
