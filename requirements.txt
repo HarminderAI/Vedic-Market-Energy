@@ -5,3 +5,4 @@ yfinance
 pandas
 finnhub-python
 pandas_ta
+textblob
