@@ -8,6 +8,10 @@ import pandas_ta as ta
 import finnhub
 import csv
 
+# Start the 'heartbeat' server
+# Note: Ensure your keep_alive.py supports the callback for EOD
+keep_alive(lambda: send_telegram_msg(calculate_eod_performance()))
+
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
@@ -108,11 +112,6 @@ def calculate_eod_performance():
     except Exception as e:
         return f"EOD Verification Error: {e}"
 
-def run_eod_flow():
-    """Callback function used by keep_alive.py to trigger EOD report."""
-    report = calculate_eod_performance()
-    send_telegram_msg(report)
-
 # --- REPORT GENERATION ---
 
 def generate_ultimate_report(vedic, rsi, vix, sentiment):
@@ -143,7 +142,7 @@ def generate_ultimate_report(vedic, rsi, vix, sentiment):
             abhijit_window = f"{m.get('start')[11:16]} - {m.get('end')[11:16]}"
             break
 
-   # 1. Fetch Shadbala Potency
+    # 1. Fetch Shadbala Potency
     planets_info = inner.get('planetary_strength', {}).get('planets', [])
     strength_map = {p['name']: p.get('shadbala', {}).get('ratio', 1.0) for p in planets_info}
 
@@ -187,9 +186,6 @@ def generate_ultimate_report(vedic, rsi, vix, sentiment):
     return report
 
 # --- EXECUTION ---
-
-# 1. Start Heartbeat Server with EOD Callback
-keep_alive(run_eod_flow)
 
 def main():
     try:
