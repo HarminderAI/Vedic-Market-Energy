@@ -33,6 +33,11 @@ NSE_SECTOR_MAP = {
 }
 
 finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
+def send_telegram_msg(text):
+    """Helper function to send messages to Telegram."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    requests.post(url, data=payload)
 
 def get_prokerala_token():
     url = "https://api.prokerala.com/token"
@@ -155,15 +160,18 @@ def main():
         vedic = get_vedic_data(token)
         report = generate_ultimate_report(vedic, rsi, vix, sentiment)
         
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": report, "parse_mode": "Markdown"})
-        
-        # 2. EOD REPORT (Trigger manually or via separate scheduled task)
-        # eod_report = calculate_eod_performance()
-        # requests.post(url, data={"chat_id": CHAT_ID, "text": eod_report, "parse_mode": "Markdown"})
+        # Use your helper function
+        send_telegram_msg(report)
+        print("Morning report sent successfully.")
 
     except Exception as e:
-        print(f"Error: {e}")
+        error_message = f"❌ **Bot Error:** {str(e)}"
+        print(error_message)
+        # Attempt to notify you of the failure
+        try:
+            send_telegram_msg(error_message)
+        except:
+            pass # Avoid infinite loops if Telegram is down
 
 if __name__ == "__main__":
     main()
