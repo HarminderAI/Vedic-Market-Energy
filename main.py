@@ -1,193 +1,256 @@
-from keep_alive import keep_alive
-import os
+# ==========================================================
+# 🏛️ INSTITUTIONAL MARKET BOT — FINAL (RATE-LIMIT SAFE)
+# ==========================================================
+
+import os, json, datetime
 import requests
-import datetime
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-import finnhub
-import csv
 from textblob import TextBlob
+import gspread
+from google.oauth2.service_account import Credentials
 
-# --- CONFIGURATION ---
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-CHAT_ID = os.environ.get('CHAT_ID')
-CLIENT_ID = os.environ.get('PROKERALA_CLIENT_ID')
-CLIENT_SECRET = os.environ.get('PROKERALA_CLIENT_SECRET')
-FINNHUB_KEY = os.environ.get('FINNHUB_API_KEY')
-GNEWS_API_KEY = os.environ.get('GNEWS_API_KEY')
-AYANAMSA_MODE = 1 
+# ==========================================================
+# CONFIG
+# ==========================================================
 
-NSE_SECTOR_MAP = {
-    "☀️ PSU": "^CNXPSUBANK", "🌙 FMCG": "^CNXFMCG", "⚔️ Infra": "^CNXINFRA",
-    "💻 IT": "^CNXIT", "🏦 Banking": "^NSEBANK", "💎 Auto": "^CNXAUTO",
-    "⚒️ Metals": "^CNXMETAL", "🚀 Tech": "^CNXIT", "💊 Pharma": "^CNXPHARMA"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
+
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+SERVICE_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
+
+SAFE_RSI = 50.0
+SAFE_VIX = 15.0
+SUCCESS_THRESHOLD = 0.20  # %
+
+SECTORS = {
+    "IT": "^CNXIT",
+    "BANK": "^NSEBANK",
+    "FMCG": "^CNXFMCG",
+    "AUTO": "^CNXAUTO",
+    "METAL": "^CNXMETAL",
+    "PHARMA": "^CNXPHARMA"
 }
 
-finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
+# ==========================================================
+# GOOGLE SHEETS
+# ==========================================================
 
-# --- NEWS INTELLIGENCE ---
-def fetch_market_news(query="Indian Stock Market"):
-    url = f"https://gnews.io/api/v4/search?q={query}&lang=en&country=in&max=3&apikey={GNEWS_API_KEY}"
+def sheet_client():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(SERVICE_JSON, scopes=scopes)
+    return gspread.authorize(creds)
+
+gc = sheet_client()
+sheet = gc.open_by_key(GOOGLE_SHEET_ID)
+state_ws = sheet.worksheet("state")
+history_ws = sheet.worksheet("history")
+
+# ==========================================================
+# TELEGRAM
+# ==========================================================
+
+def send_msg(text):
     try:
-        response = requests.get(url)
-        articles = response.json().get('articles', [])
-        sentiment_score = 0
-        headlines = []
-        for art in articles:
-            sentiment_score += TextBlob(art['title']).sentiment.polarity
-            headlines.append(art['title'])
-        avg_sentiment = sentiment_score / len(articles) if articles else 0
-        return headlines, round(avg_sentiment, 2)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": text},
+            timeout=10
+        )
     except:
-        return [], 0
+        pass
 
-# --- CORE UTILITIES ---
-def send_telegram_msg(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    try: requests.post(url, data=payload)
-    except: pass
+# ==========================================================
+# SAFE MARKET DOWNLOAD
+# ==========================================================
 
-def get_prokerala_token():
-    url = "https://api.prokerala.com/token"
-    data = {'grant_type': 'client_credentials', 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET}
-    return requests.post(url, data=data).json().get('access_token')
-
-def get_market_intelligence():
+def safe_download(ticker, days):
     try:
-        # 1. Attempt Downloads
-        nifty = yf.download("^NSEI", period="60d", interval="1d", progress=False)
-        vix = yf.download("^INDIAVIX", period="5d", interval="1d", progress=False)
+        df = yf.download(ticker, period=f"{days}d", progress=False)
+        if df is None or df.empty:
+            return None
+        df.columns = df.columns.get_level_values(0)
+        return df
+    except:
+        return None
 
-        # 2. Defensive Check for Nifty (RSI)
-        if nifty is not None and not nifty.empty and len(nifty) > 14:
-            nifty['RSI'] = ta.rsi(nifty['Close'], length=14)
-            latest_rsi = float(nifty['RSI'].iloc[-1])
-            # Handle NaN RSI
-            if pd.isna(latest_rsi): latest_rsi = 50.0
-        else:
-            print("⚠️ Nifty data unavailable. Defaulting RSI to 50.")
-            latest_rsi = 50.0
+# ==========================================================
+# NEWS SENTIMENT (CONTEXT ONLY)
+# ==========================================================
 
-        # 3. Defensive Check for VIX
-        if vix is not None and not vix.empty:
-            latest_vix = float(vix['Close'].iloc[-1])
-        else:
-            print("⚠️ VIX data unavailable. Defaulting to 15.")
-            latest_vix = 15.0
-
-        return round(latest_rsi, 2), round(latest_vix, 2)
-
-    except Exception as e:
-        print(f"❌ Market Logic Error: {e}")
-        return 50.0, 15.0  # Safe Fallback values
-
-def calculate_eod_performance():
+def fetch_news_sentiment():
     try:
-        tickers = list(NSE_SECTOR_MAP.values())
-        data = yf.download(tickers, period="2d", interval="1d", progress=False)
-        eod_msg = "📊 *EOD Market Verification* 📊\n"
-        for sector_name, ticker in NSE_SECTOR_MAP.items():
-            if ticker in data['Close']:
-                prices = data['Close'][ticker]
-                pct = ((prices.iloc[-1] - prices.iloc[-2]) / prices.iloc[-2]) * 100
-                eod_msg += f"{'📈' if pct > 0 else '📉'} {sector_name}: {pct:+.2f}%\n"
-        return eod_msg
-    except Exception as e: return f"EOD Error: {e}"
+        url = (
+            "https://gnews.io/api/v4/search"
+            "?q=Nifty%20OR%20Indian%20Stock%20Market"
+            "&lang=en&country=in&max=3"
+            f"&apikey={GNEWS_API_KEY}"
+        )
+        arts = requests.get(url, timeout=10).json().get("articles", [])
+        if not arts:
+            return 0.0
+        return round(sum(TextBlob(a["title"]).sentiment.polarity for a in arts) / len(arts), 2)
+    except:
+        return 0.0
 
-# Start heartbeat with EOD callback
-keep_alive(lambda: send_telegram_msg(calculate_eod_performance()))
+# ==========================================================
+# METRICS FROM PRELOADED NIFTY
+# ==========================================================
 
-# --- REPORT GENERATION ---
-def generate_ultimate_report(vedic, rsi, vix, news_data):
-    headlines, news_sentiment = news_data
-    if not vedic or 'data' not in vedic:
-        return "❌ **Vedic Data Error:** API response empty."
+def market_metrics_from_df(nifty_df):
+    try:
+        if nifty_df is None or len(nifty_df) < 20:
+            return SAFE_RSI, False, None
 
-    inner = vedic.get('data', {})
-    tithi = inner.get('tithi', [{}])[0].get('name', 'N/A')
-    nakshatra = inner.get('nakshatra', [{}])[0].get('name', 'N/A')
-    
-    rahu_data = inner.get('rahu_kaal', [])
-    rahu_window = f"{rahu_data[0]['start'][11:16]} - {rahu_data[0]['end'][11:16]}" if rahu_data else "N/A"
-    
-    abhijit_window = "N/A"
-    for m in inner.get('muhurta', []):
-        if m.get('name') == 'Abhijit':
-            abhijit_window = f"{m.get('start')[11:16]} - {m.get('end')[11:16]}"
-            break
+        rsi_series = ta.rsi(nifty_df["Close"], 14)
+        rsi = SAFE_RSI if rsi_series is None or pd.isna(rsi_series.iloc[-1]) else round(float(rsi_series.iloc[-1]), 2)
 
-    planets_info = inner.get('planetary_strength', {}).get('planets', [])
-    strength_map = {p['name']: p.get('shadbala', {}).get('ratio', 1.0) for p in planets_info}
+        vol_avg = nifty_df["Volume"].rolling(10).mean()
+        vol_ok = not pd.isna(vol_avg.iloc[-1]) and nifty_df["Volume"].iloc[-1] > vol_avg.iloc[-1]
 
-    def calc_stars(planet_name):
-        ratio = strength_map.get(planet_name, 1.0)
-        stars = 3
-        if ratio >= 1.3: stars = 5
-        elif ratio >= 1.1: stars = 4
-        elif ratio <= 0.7: stars = 1
-        elif ratio <= 0.9: stars = 2
-        
-        # News Sentiment Adjustment
-        if news_sentiment > 0.15: stars = min(stars + 1, 5)
-        elif news_sentiment < -0.15: stars = max(stars - 1, 1)
-        return stars
+        close = float(nifty_df["Close"].iloc[-1])
 
-    sector_map = {k: calc_stars(v) for k, v in {
-        "☀️ PSU": "Sun", "🌙 FMCG": "Moon", "⚔️ Infra": "Mars", 
-        "💻 IT": "Mercury", "🏦 Banking": "Jupiter", "💎 Auto": "Venus",
-        "⚒️ Metals": "Saturn", "🚀 Tech": "Rahu", "💊 Pharma": "Ketu"
-    }.items()}
-    
-    heatmap = "\n".join([f"{k}: {'⭐' * v}" for k, v in sector_map.items()])
-    news_bullet = "\n".join([f"• {h[:55]}..." for h in headlines])
+        return rsi, vol_ok, close
+    except:
+        return SAFE_RSI, False, None
 
-    report = (
-        f"🏛️ *Vedic Institutional Quant* 🏛️\n"
-        f"📅 {datetime.datetime.now().strftime('%d %b %Y')}\n"
-        f"--------------------------\n"
-        f"🌟 *ABHIJIT:* {abhijit_window} | 🚫 *RAHU:* {rahu_window}\n"
-        f"--------------------------\n"
-        f"✨ {tithi} | ⭐ {nakshatra}\n"
-        f"📊 RSI: {rsi} | VIX: {vix}\n"
-        f"--------------------------\n"
-        f"📰 *News Sentiment:* {news_sentiment:+.2f}\n"
-        f"{news_bullet}\n"
-        f"--------------------------\n"
-        f"{heatmap}\n"
-        f"--------------------------\n"
-        f"🎯 *Final Conviction:* {'HIGH' if news_sentiment > 0.1 else 'MODERATE'}\n"
-        f"--------------------------\n"
-        f"⚠️ *Not SEBI advice.*"
+# ==========================================================
+# MARKET REGIME FROM SAME DATA
+# ==========================================================
+
+def market_regime_from_df(nifty_df):
+    try:
+        adx = ta.adx(nifty_df["High"], nifty_df["Low"], nifty_df["Close"])["ADX_14"].iloc[-1]
+        atr = ta.atr(nifty_df["High"], nifty_df["Low"], nifty_df["Close"]).iloc[-1]
+        vol = nifty_df["Close"].pct_change().std()
+
+        if adx > 20 and atr > vol:
+            return "TRENDING"
+        if atr > vol * 1.5:
+            return "VOLATILE"
+        return "RANGE"
+    except:
+        return "UNKNOWN"
+
+# ==========================================================
+# SECTOR ROTATION (RELATIVE STRENGTH)
+# ==========================================================
+
+def sector_rotation_from_df(nifty_df):
+    out = {}
+    try:
+        nifty_ret = (nifty_df["Close"].iloc[-1] / nifty_df["Close"].iloc[0] - 1) * 100
+    except:
+        nifty_ret = 0.0
+
+    for k, t in SECTORS.items():
+        df = safe_download(t, 20)
+        if df is None:
+            out[k] = 0.0
+            continue
+        sec_ret = (df["Close"].iloc[-1] / df["Close"].iloc[0] - 1) * 100
+        out[k] = round(sec_ret - nifty_ret, 2)
+
+    return out
+
+# ==========================================================
+# STATE HANDLING (SHEETS)
+# ==========================================================
+
+def load_yesterday():
+    rows = state_ws.get_all_records()
+    if not rows:
+        return None
+    try:
+        return json.loads(rows[0]["value"])
+    except:
+        return None
+
+def save_today(snapshot):
+    state_ws.clear()
+    state_ws.append_row(["yesterday", json.dumps(snapshot)])
+
+# ==========================================================
+# VALIDATION
+# ==========================================================
+
+def validate_yesterday(prev, today_close):
+    try:
+        delta = ((today_close - prev["nifty_close"]) / prev["nifty_close"]) * 100
+    except:
+        return
+
+    if delta >= SUCCESS_THRESHOLD:
+        result = "CORRECT"
+    elif delta <= -SUCCESS_THRESHOLD:
+        result = "INCORRECT"
+    else:
+        result = "NO_EDGE"
+
+    history_ws.append_row([
+        prev["date"], prev["bias"], prev["score"],
+        prev["regime"], round(delta, 2), result
+    ])
+
+    send_msg(
+        f"📊 Yesterday Validation\n"
+        f"Bias: {prev['bias']}\n"
+        f"Move: {delta:+.2f}%\n"
+        f"Result: {result}"
     )
-    return report
+
+# ==========================================================
+# MAIN
+# ==========================================================
 
 def main():
-    try:
-        token = get_prokerala_token()
-        news_data = fetch_market_news()
-        
-        # Tech Intelligence
-        nifty = yf.download("^NSEI", period="5d", progress=False)
-        rsi = round(ta.rsi(nifty['Close'], length=14).iloc[-1], 2)
-        vix = round(yf.download("^INDIAVIX", period="1d", progress=False)['Close'].iloc[-1], 2)
-        
-        # Vedic Data
-        params = {
-            'datetime': datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S+05:30'),
-            'coordinates': '23.1765,75.7885', 'ayanamsa': AYANAMSA_MODE,
-            'la-dimension': 'planet-position,rahu-kaal,ashtakavarga,planetary-strength,muhurta'
-        }
-        vedic = requests.get("https://api.prokerala.com/v2/astrology/panchang", 
-                             params=params, headers={'Authorization': f'Bearer {token}'}).json()
-        
-        report = generate_ultimate_report(vedic, rsi, vix, news_data)
-        send_telegram_msg(report)
-        print("Report sent successfully.")
+    prev = load_yesterday()
 
-    except Exception as e:
-        send_telegram_msg(f"❌ **Bot Error:** {str(e)}")
+    nifty = safe_download("^NSEI", 80)
+    if nifty is None:
+        return
+
+    rsi, vol_ok, close = market_metrics_from_df(nifty)
+    regime = market_regime_from_df(nifty)
+    news = fetch_news_sentiment()
+    sectors = sector_rotation_from_df(nifty)
+
+    score = (
+        (20 if rsi > 55 else 10) +
+        (20 if vol_ok else 10) +
+        (10 if news > 0 else 5)
+    )
+
+    bias = "BULLISH" if score >= 65 else "NEUTRAL"
+
+    if prev:
+        validate_yesterday(prev, close)
+
+    snapshot = {
+        "date": str(datetime.date.today()),
+        "bias": bias,
+        "score": score,
+        "regime": regime,
+        "nifty_close": close
+    }
+
+    save_today(snapshot)
+
+    sector_text = "\n".join([f"• {k}: {v:+.2f}%" for k, v in sectors.items()])
+
+    send_msg(
+        "🏛️ Institutional Market Report\n"
+        f"RSI: {rsi}\n"
+        f"Volume Confirmed: {vol_ok}\n"
+        f"Regime: {regime}\n\n"
+        f"Sector Rotation:\n{sector_text}\n\n"
+        f"Score: {score}/100\n"
+        f"Bias: {bias}\n\n"
+        "⚠️ Not SEBI Advice"
+    )
 
 if __name__ == "__main__":
     main()
