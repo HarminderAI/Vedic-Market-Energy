@@ -1,11 +1,23 @@
 # ==========================================================
-# 📰 NEWS LOGIC — CONTEXTUAL SENTIMENT MODULE (FINAL)
+# 📰 NEWS LOGIC — CONTEXTUAL SENTIMENT MODULE (PRODUCTION)
 # ==========================================================
 
 import os
 import requests
 from textblob import TextBlob
 from datetime import datetime, timedelta
+
+# ----------------------------------------------------------
+# NLTK BOOTSTRAP (RENDER SAFE)
+# ----------------------------------------------------------
+# Render containers do NOT persist NLTK data.
+# This prevents random LookupError crashes on cold starts.
+
+import nltk
+try:
+    nltk.data.find("tokenizers/punkt_tab")
+except LookupError:
+    nltk.download("punkt_tab")
 
 # ----------------------------------------------------------
 # CONFIG
@@ -18,6 +30,7 @@ DEFAULT_SUBJECTIVITY = 0.0
 
 MAX_ARTICLES = 3
 TIMEOUT = 10
+HOURS_BACK = 12
 
 KEYWORDS = [
     "nifty", "sensex", "market", "stocks", "equity",
@@ -33,20 +46,18 @@ def fetch_market_news(
     country="in",
     lang="en",
     max_articles=MAX_ARTICLES,
-    hours_back=12
+    hours_back=HOURS_BACK
 ):
     """
-    Fetches recent market news and computes:
-    - average sentiment polarity
-    - average subjectivity
-    - filtered headlines
+    Fetches recent macro market news and computes:
 
     Returns:
-        sentiment (float)
-        subjectivity (float)
-        headlines (list[str])
+        sentiment (float)     -> avg polarity
+        subjectivity (float)  -> avg subjectivity
+        headlines (list[str]) -> filtered headlines
     """
 
+    # News must NEVER crash the bot
     if not GNEWS_API_KEY:
         return DEFAULT_SENTIMENT, DEFAULT_SUBJECTIVITY, []
 
@@ -95,7 +106,7 @@ def fetch_market_news(
         return avg_sentiment, avg_subjectivity, headlines
 
     except Exception:
-        # News must NEVER crash the bot
+        # Absolute safety: news is CONTEXT, never a failure point
         return DEFAULT_SENTIMENT, DEFAULT_SUBJECTIVITY, []
 
 # ----------------------------------------------------------
@@ -103,6 +114,10 @@ def fetch_market_news(
 # ----------------------------------------------------------
 
 def format_news_block(sentiment, subjectivity, headlines):
+    """
+    Formats news output for Telegram readability
+    """
+
     if not headlines:
         return "📰 News: Neutral (No relevant macro headlines)"
 
