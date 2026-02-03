@@ -37,18 +37,28 @@ def get_panchang_data(token):
     return response.json()
 
 def generate_market_report(data):
-    panchang = data.get('data', {}).get('panchang', {})
-    tithi = panchang.get('tithi', [{}])[0].get('name', 'Unknown')
-    nakshatra = panchang.get('nakshatra', [{}])[0].get('name', 'Unknown')
+    # Dig into the JSON structure carefully
+    panchang_data = data.get('data', {}).get('panchang', {})
+    
+    # Prokerala V2 usually returns these as lists
+    # We grab the first item [0] and then the 'name'
+    tithis = panchang_data.get('tithi', [])
+    nakshatras = panchang_data.get('nakshatra', [])
+    
+    tithi = tithis[0].get('name', 'Unknown') if tithis else 'Unknown'
+    nakshatra = nakshatras[0].get('name', 'Unknown') if nakshatras else 'Unknown'
+    
     weekday_idx = datetime.datetime.now().weekday()
 
+    # Sector Ratings (out of 5 stars)
     it_rating = "⭐⭐"
     banking_rating = "⭐⭐"
     pharma_rating = "⭐⭐"
 
+    # Logic remains the same
     if weekday_idx == 2: it_rating = "⭐⭐⭐⭐"
-    if nakshatra in ["Revati", "Jyeshtha"]: it_rating = "⭐⭐⭐⭐⭐"
-
+    if nakshatra in ["Revati", "Jyeshtha", "Ashlesha"]: it_rating = "⭐⭐⭐⭐⭐"
+    
     if weekday_idx == 3: banking_rating = "⭐⭐⭐⭐"
     if nakshatra == "Pushya": banking_rating = "⭐⭐⭐⭐⭐"
 
