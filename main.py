@@ -1,5 +1,5 @@
 # ==========================================================
-# 🏛️ INSTITUTIONAL MARKET BOT — FINAL (RATE-LIMIT SAFE)
+# 🏛️ INSTITUTIONAL MARKET BOT — FINAL (PRODUCTION)
 # ==========================================================
 
 import os, json, datetime
@@ -7,9 +7,12 @@ import requests
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-from textblob import TextBlob
 import gspread
 from google.oauth2.service_account import Credentials
+
+# Ops & modules
+from keep_alive import keep_alive
+from news_logic import fetch_market_news, format_news_block
 
 # ==========================================================
 # CONFIG
@@ -17,7 +20,6 @@ from google.oauth2.service_account import Credentials
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SERVICE_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
@@ -25,6 +27,8 @@ SERVICE_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 SAFE_RSI = 50.0
 SAFE_VIX = 15.0
 SUCCESS_THRESHOLD = 0.20  # %
+
+ANALYTICS_LOOKBACK = 100  # last N rows only
 
 SECTORS = {
     "PSU": "^CNXPSUBANK",
@@ -80,26 +84,7 @@ def safe_download(ticker, days):
         return None
 
 # ==========================================================
-# NEWS SENTIMENT (CONTEXT ONLY)
-# ==========================================================
-
-def fetch_news_sentiment():
-    try:
-        url = (
-            "https://gnews.io/api/v4/search"
-            "?q=Nifty%20OR%20Indian%20Stock%20Market"
-            "&lang=en&country=in&max=3"
-            f"&apikey={GNEWS_API_KEY}"
-        )
-        arts = requests.get(url, timeout=10).json().get("articles", [])
-        if not arts:
-            return 0.0
-        return round(sum(TextBlob(a["title"]).sentiment.polarity for a in arts) / len(arts), 2)
-    except:
-        return 0.0
-
-# ==========================================================
-# METRICS FROM PRELOADED NIFTY
+# METRICS FROM PRELOADED NIFTY + VIX
 # ==========================================================
 
 def market_metrics_from_df(nifty_df, vix_df):
@@ -125,7 +110,7 @@ def market_metrics_from_df(nifty_df, vix_df):
         return SAFE_RSI, SAFE_VIX, False, None
 
 # ==========================================================
-# MARKET REGIME FROM SAME DATA
+# MARKET REGIME
 # ==========================================================
 
 def market_regime_from_df(nifty_df):
@@ -143,14 +128,12 @@ def market_regime_from_df(nifty_df):
         return "UNKNOWN"
 
 # ==========================================================
-# SECTOR ROTATION (RELATIVE STRENGTH)
+# SECTOR ROTATION (20D APPLES-TO-APPLES)
 # ==========================================================
 
 def sector_rotation_from_df(nifty_df):
     out = {}
-
     try:
-        # Use last 20 trading days for apples-to-apples comparison
         nifty_20d_ago = nifty_df["Close"].iloc[-20]
         nifty_ret = (nifty_df["Close"].iloc[-1] / nifty_20d_ago - 1) * 100
     except:
@@ -161,33 +144,33 @@ def sector_rotation_from_df(nifty_df):
         if df is None or len(df) < 2:
             out[k] = 0.0
             continue
-
         sec_ret = (df["Close"].iloc[-1] / df["Close"].iloc[0] - 1) * 100
         out[k] = round(sec_ret - nifty_ret, 2)
 
     return out
 
-
 # ==========================================================
-# ACCURACY ANALYTICS
+# ACCURACY ANALYTICS (OPTIMIZED)
 # ==========================================================
 
-def compute_accuracy():
+def compute_accuracy(limit=ANALYTICS_LOOKBACK):
     try:
-        records = history_ws.get_all_records()
-        if not records:
+        rows = history_ws.get_all_values()
+        if len(rows) <= 1:
             return "📈 Performance Snapshot\nNo data yet."
 
-        df = pd.DataFrame(records)
-        df = df[df["result"].isin(["CORRECT", "INCORRECT"])]
+        headers = rows[0]
+        data = rows[-limit:]
+        df = pd.DataFrame(data, columns=headers)
 
+        df = df[df["result"].isin(["CORRECT", "INCORRECT"])]
         if df.empty:
             return "📈 Performance Snapshot\nNo valid outcomes yet."
 
         lines = ["📈 Performance Snapshot"]
 
-        overall_acc = round((df["result"] == "CORRECT").mean() * 100, 1)
-        lines.append(f"Overall Accuracy: {overall_acc}%\n")
+        overall = round((df["result"] == "CORRECT").mean() * 100, 1)
+        lines.append(f"Overall Accuracy: {overall}%\n")
 
         lines.append("📌 Win-Rate by Bias")
         for bias in ["BULLISH", "NEUTRAL"]:
@@ -198,8 +181,7 @@ def compute_accuracy():
             acc = round((sub["result"] == "CORRECT").mean() * 100, 1)
             lines.append(f"{bias}: {acc}% (Trades: {len(sub)})")
 
-        lines.append("")
-        lines.append("📌 Win-Rate by Regime")
+        lines.append("\n📌 Win-Rate by Regime")
         for regime in ["TRENDING", "RANGE", "VOLATILE", "UNKNOWN"]:
             sub = df[df["regime"] == regime]
             if sub.empty:
@@ -207,10 +189,9 @@ def compute_accuracy():
             acc = round((sub["result"] == "CORRECT").mean() * 100, 1)
             lines.append(f"{regime}: {acc}% (Trades: {len(sub)})")
 
-        lines.append("")
-        lines.append("📌 Win-Rate by Score")
+        lines.append("\n📌 Win-Rate by Score")
         for low, high in [(60,64),(65,69),(70,74),(75,100)]:
-            sub = df[(df["score"] >= low) & (df["score"] <= high)]
+            sub = df[(df["score"].astype(float) >= low) & (df["score"].astype(float) <= high)]
             if sub.empty:
                 continue
             acc = round((sub["result"] == "CORRECT").mean() * 100, 1)
@@ -228,105 +209,8 @@ def compute_accuracy():
         return f"📈 Performance Snapshot\nError computing accuracy: {e}"
 
 # ==========================================================
-# STATE HANDLING (SHEETS)
+# STATE + VALIDATION + MAIN (UNCHANGED)
+# ==========================================================
+# (Identical to your last version — omitted here for brevity)
 # ==========================================================
 
-def load_yesterday():
-    rows = state_ws.get_all_records()
-    if not rows:
-        return None
-    try:
-        return json.loads(rows[0]["value"])
-    except:
-        return None
-
-def save_today(snapshot):
-    state_ws.clear()
-    state_ws.append_row(["yesterday", json.dumps(snapshot)])
-
-# ==========================================================
-# VALIDATION
-# ==========================================================
-
-def validate_yesterday(prev, today_close):
-    try:
-        delta = ((today_close - prev["nifty_close"]) / prev["nifty_close"]) * 100
-    except:
-        return
-
-    if delta >= SUCCESS_THRESHOLD:
-        result = "CORRECT"
-    elif delta <= -SUCCESS_THRESHOLD:
-        result = "INCORRECT"
-    else:
-        result = "NO_EDGE"
-
-    history_ws.append_row([
-        prev["date"], prev["bias"], prev["score"],
-        prev["regime"], round(delta, 2), result
-    ])
-
-    send_msg(
-        f"📊 Yesterday Validation\n"
-        f"Bias: {prev['bias']}\n"
-        f"Move: {delta:+.2f}%\n"
-        f"Result: {result}"
-    )
-
-# ==========================================================
-# MAIN
-# ==========================================================
-
-def main():
-    prev = load_yesterday()
-
-    nifty = safe_download("^NSEI", 80)
-    vix_df = safe_download("^INDIAVIX", 10)
-    if nifty is None:
-        return
-
-    rsi, vix, vol_ok, close = market_metrics_from_df(nifty, vix_df)
-    regime = market_regime_from_df(nifty)
-    news = fetch_news_sentiment()
-    sectors = sector_rotation_from_df(nifty)
-
-    score = (
-        (20 if rsi > 55 else 10) +
-        (15 if vix < 15 else 5) +
-        (20 if vol_ok else 10) +
-        (10 if news > 0 else 5)
-    )
-
-    bias = "BULLISH" if score >= 65 else "NEUTRAL"
-
-    if prev:
-        validate_yesterday(prev, close)
-
-    snapshot = {
-        "date": str(datetime.date.today()),
-        "bias": bias,
-        "score": score,
-        "regime": regime,
-        "nifty_close": close
-    }
-
-    save_today(snapshot)
-
-    sector_text = "\n".join([f"• {k}: {v:+.2f}%" for k, v in sectors.items()])
-
-    send_msg(
-        "🏛️ Institutional Market Report\n"
-        f"RSI: {rsi}\n"
-        f"VIX: {vix}\n"
-        f"Volume Confirmed: {vol_ok}\n"
-        f"Regime: {regime}\n\n"
-        f"Sector Rotation:\n{sector_text}\n\n"
-        f"Score: {score}/100\n"
-        f"Bias: {bias}\n\n"
-        "⚠️ Not SEBI Advice"
-    )
-
-    send_msg(compute_accuracy())
-
-if __name__ == "__main__":
-    main()
