@@ -29,17 +29,13 @@ def get_prokerala_token():
 def get_market_intelligence():
     """Fetches Technicals (RSI/VIX) and Sentiment (Finnhub)."""
     try:
-        # 1. Technical Data (Nifty 50)
         nifty = yf.download("^NSEI", period="60d", interval="1d")
         vix = yf.download("^INDIAVIX", period="1d")
         
-        # Calculate RSI using pandas_ta
         nifty['RSI'] = ta.rsi(nifty['Close'], length=14)
         latest_rsi = round(nifty['RSI'].iloc[-1], 2)
         latest_vix = round(vix['Close'].iloc[-1].item(), 2)
         
-        # 2. Finnhub News Sentiment
-        # Global sentiment proxy (Apple) often leads tech/market mood
         sentiment_data = finnhub_client.news_sentiment('AAPL')
         bullish_pct = sentiment_data.get('sentiment', {}).get('bullishPercent', 0.5)
         
@@ -65,31 +61,57 @@ def generate_ultimate_report(vedic, rsi, vix, sentiment):
     tithi = inner.get('tithi', [{}])[0].get('name', 'N/A')
     nakshatra = inner.get('nakshatra', [{}])[0].get('name', 'N/A')
     
-    # Logic: Cross-Verification
+    # 1. Rahu Kaal Timer Extraction
+    rahu_info = inner.get('rahu_kaal', [{}])[0]
+    rahu_start = datetime.datetime.fromisoformat(rahu_info.get('start')).strftime('%I:%M %p')
+    rahu_end = datetime.datetime.fromisoformat(rahu_info.get('end')).strftime('%I:%M %p')
+
+    # 2. Market Sentiment & Conviction Logic
     sentiment_label = "Bullish 🟢" if sentiment > 0.6 else "Bearish 🔴" if sentiment < 0.4 else "Neutral ⚖️"
     conviction = "HIGH" if (rsi < 65 and sentiment > 0.55) else "MODERATE"
     if vix > 22: conviction = "LOW (Extreme Volatility)"
 
-    # Sector Strength (Vedic + Sentiment Filter)
-    # Using a 1-5 star system
-    it_stars = 3
-    if sentiment > 0.6: it_stars += 1
-    if nakshatra in ["Revati", "Jyeshtha"]: it_stars += 1
+    # 3. Shadbala (Planetary Strength) Logic
+    planets_info = inner.get('planetary_strength', {}).get('planets', [])
+    strength_map = {p['name']: p.get('shadbala', {}).get('ratio', 1.0) for p in planets_info}
 
+    # Helper for 9-Sector Mapping with Shadbala weights
+    def calc_stars(planet_name, base=3):
+        ratio = strength_map.get(planet_name, 1.0)
+        score = base
+        if ratio > 1.2: score += 1
+        elif ratio < 0.8: score -= 1
+        if planet_name in ["Mercury", "Rahu"] and sentiment > 0.6: score += 1
+        return min(max(score, 1), 5)
+
+    sector_heatmap = {
+        "☀️ PSU/Energy (Sun)": calc_stars("Sun"),
+        "🌙 FMCG/Dairy (Moon)": calc_stars("Moon"),
+        "⚔️ Real Estate (Mars)": calc_stars("Mars"),
+        "💻 IT/Tech (Mercury)": calc_stars("Mercury"),
+        "🏦 Banking/Fin (Jupiter)": calc_stars("Jupiter"),
+        "💎 Luxury/Auto (Venus)": calc_stars("Venus"),
+        "⚒️ Metals/Mining (Saturn)": calc_stars("Saturn"),
+        "🚀 Aviation/NewTech (Rahu)": calc_stars("Rahu"),
+        "💊 Pharma/Res (Ketu)": calc_stars("Ketu")
+    }
+    heatmap_text = "\n".join([f"{k}: {'⭐' * v}" for k, v in sector_heatmap.items()])
+
+    # 4. Assembly of Final Report
     report = (
         f"🏛️ *Vedic Institutional Quant* 🏛️\n"
         f"📅 {datetime.datetime.now().strftime('%d %b %Y')}\n"
         f"✨ {tithi} | ⭐ {nakshatra}\n"
         f"--------------------------\n"
+        f"🚫 *RAHU KAAL (No Trade):* {rahu_start} - {rahu_end}\n"
+        f"--------------------------\n"
         f"📊 *Pulse:* RSI {rsi} | VIX {vix}\n"
         f"📰 *Sentiment:* {sentiment_label} ({int(sentiment*100)}%)\n"
         f"--------------------------\n"
-        f"💻 IT (Mercury): {'⭐'*it_stars}\n"
-        f"🏦 Banking (Jupiter): {'⭐'*4}\n"
-        f"💊 Pharma (Ketu): {'⭐'*3}\n"
+        f"{heatmap_text}\n"
         f"--------------------------\n"
         f"🎯 *Conviction Score:* {conviction}\n"
-        f"💡 *Astro-Tip:* " + ("Technical & Sentiment alignment confirmed." if conviction == "HIGH" else "Wait for technical cooling.") +
+        f"💡 *Tip:* Avoid fresh positions during Rahu Kaal. Focus on Shadbala-strong sectors today."
         f"\n--------------------------\n"
         f"⚠️ *Educational Study Only. Not SEBI advice.*"
     )
@@ -104,7 +126,7 @@ def main():
         
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": report, "parse_mode": "Markdown"})
-        print("Success: Final Institutional Report Sent.")
+        print("Success: 9-Planet Institutional Report with Rahu Kaal Sent.")
     except Exception as e:
         print(f"Deployment Error: {e}")
 
