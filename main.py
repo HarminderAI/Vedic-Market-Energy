@@ -4,9 +4,10 @@ import requests
 import datetime
 import yfinance as yf
 import pandas as pd
+import pandas_ta as ta
 import finnhub
 
-# Start the 'heartbeat' server
+# Start the 'heartbeat' server for 24/7 uptime
 keep_alive()
 
 # --- CONFIGURATION (From Environment Variables) ---
@@ -25,71 +26,70 @@ def get_prokerala_token():
     response = requests.post(url, data=data)
     return response.json().get('access_token')
 
-def get_market_quant_data():
-    """Fetches RSI, VIX, and News Sentiment."""
+def get_market_intelligence():
+    """Fetches Technicals (RSI/VIX) and Sentiment (Finnhub)."""
     try:
-        # 1. Technical Metrics (Nifty 50)
+        # 1. Technical Data (Nifty 50)
         nifty = yf.download("^NSEI", period="60d", interval="1d")
         vix = yf.download("^INDIAVIX", period="1d")
         
-        # Manual RSI Calculation
-        delta = nifty['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        
-        latest_rsi = round(rsi.iloc[-1].item(), 2)
+        # Calculate RSI using pandas_ta
+        nifty['RSI'] = ta.rsi(nifty['Close'], length=14)
+        latest_rsi = round(nifty['RSI'].iloc[-1], 2)
         latest_vix = round(vix['Close'].iloc[-1].item(), 2)
         
-        # 2. News Sentiment (Global Market Sentiment proxy)
-        sentiment_data = finnhub_client.news_sentiment('AAPL') # Using Apple as a global tech sentiment proxy
+        # 2. Finnhub News Sentiment
+        # Global sentiment proxy (Apple) often leads tech/market mood
+        sentiment_data = finnhub_client.news_sentiment('AAPL')
         bullish_pct = sentiment_data.get('sentiment', {}).get('bullishPercent', 0.5)
         
         return latest_rsi, latest_vix, bullish_pct
     except Exception as e:
-        print(f"Market Data Error: {e}")
+        print(f"Data Error: {e}")
         return 50.0, 15.0, 0.5
 
 def get_vedic_data(token):
+    """Fetches Institutional Vedic Dimensions."""
     url = "https://api.prokerala.com/v2/astrology/panchang"
     params = {
         'datetime': datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S+05:30'),
-        'coordinates': '23.1765,75.7885', # Ujjain
+        'coordinates': '23.1765,75.7885',
         'ayanamsa': 1,
-        'la-dimension': 'planet-position,rahu-kaal,hora'
+        'la-dimension': 'planet-position,rahu-kaal,ashtakavarga,planetary-strength'
     }
     headers = {'Authorization': f'Bearer {token}'}
     return requests.get(url, params=params, headers=headers).json()
 
-def generate_final_report(vedic, rsi, vix, sentiment):
+def generate_ultimate_report(vedic, rsi, vix, sentiment):
     inner = vedic.get('data', {})
     tithi = inner.get('tithi', [{}])[0].get('name', 'N/A')
     nakshatra = inner.get('nakshatra', [{}])[0].get('name', 'N/A')
-    hora = inner.get('hora', [{}])[0].get('name', 'N/A')
     
-    # Logic: Confirmation Filter
+    # Logic: Cross-Verification
     sentiment_label = "Bullish 🟢" if sentiment > 0.6 else "Bearish 🔴" if sentiment < 0.4 else "Neutral ⚖️"
-    
-    # High Conviction logic
-    conviction = "HIGH" if (rsi < 70 and sentiment > 0.5) else "MODERATE"
-    if vix > 20: conviction = "LOW (High Volatility)"
+    conviction = "HIGH" if (rsi < 65 and sentiment > 0.55) else "MODERATE"
+    if vix > 22: conviction = "LOW (Extreme Volatility)"
+
+    # Sector Strength (Vedic + Sentiment Filter)
+    # Using a 1-5 star system
+    it_stars = 3
+    if sentiment > 0.6: it_stars += 1
+    if nakshatra in ["Revati", "Jyeshtha"]: it_stars += 1
 
     report = (
-        f"🏛️ *Vedic Quant Institutional* 🏛️\n"
+        f"🏛️ *Vedic Institutional Quant* 🏛️\n"
         f"📅 {datetime.datetime.now().strftime('%d %b %Y')}\n"
-        f"✨ Tithi: {tithi} | ⭐ Nakshatra: {nakshatra}\n"
-        f"⌛ Current Hora: {hora}\n"
+        f"✨ {tithi} | ⭐ {nakshatra}\n"
         f"--------------------------\n"
-        f"📊 *Market Pulse:* RSI: {rsi} | VIX: {vix}\n"
-        f"📰 *News Sentiment:* {sentiment_label} ({int(sentiment*100)}%)\n"
+        f"📊 *Pulse:* RSI {rsi} | VIX {vix}\n"
+        f"📰 *Sentiment:* {sentiment_label} ({int(sentiment*100)}%)\n"
         f"--------------------------\n"
-        f"💻 IT (Mercury): {'⭐'* (3 if sentiment > 0.4 else 2)}\n"
+        f"💻 IT (Mercury): {'⭐'*it_stars}\n"
         f"🏦 Banking (Jupiter): {'⭐'*4}\n"
         f"💊 Pharma (Ketu): {'⭐'*3}\n"
         f"--------------------------\n"
         f"🎯 *Conviction Score:* {conviction}\n"
-        f"💡 *Tip:* " + ("Technical confirmation received." if conviction == "HIGH" else "Wait for RSI to cool down.") +
+        f"💡 *Astro-Tip:* " + ("Technical & Sentiment alignment confirmed." if conviction == "HIGH" else "Wait for technical cooling.") +
         f"\n--------------------------\n"
         f"⚠️ *Educational Study Only. Not SEBI advice.*"
     )
@@ -98,15 +98,15 @@ def generate_final_report(vedic, rsi, vix, sentiment):
 def main():
     try:
         token = get_prokerala_token()
-        rsi, vix, sentiment = get_market_quant_data()
+        rsi, vix, sentiment = get_market_intelligence()
         vedic = get_vedic_data(token)
-        report = generate_final_report(vedic, rsi, vix, sentiment)
+        report = generate_ultimate_report(vedic, rsi, vix, sentiment)
         
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": report, "parse_mode": "Markdown"})
-        print("Final Institutional Report Sent.")
+        print("Success: Final Institutional Report Sent.")
     except Exception as e:
-        print(f"Error in Main: {e}")
+        print(f"Deployment Error: {e}")
 
 if __name__ == "__main__":
     main()
