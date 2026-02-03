@@ -16,7 +16,7 @@ CLIENT_ID = os.environ['PROKERALA_CLIENT_ID']
 CLIENT_SECRET = os.environ['PROKERALA_CLIENT_SECRET']
 
 def get_prokerala_token():
-    """Authenticates with Prokerala to get a temporary Access Token."""
+    """Authenticates with Prokerala to get a temporary Access Token."""
     url = "https://api.prokerala.com/token"
     data = {
         'grant_type': 'client_credentials',
