@@ -116,21 +116,26 @@ def run_eod_flow():
 # --- REPORT GENERATION ---
 
 def generate_ultimate_report(vedic, rsi, vix, sentiment):
-    inner = vedic.get('data', {})
-    tithi = inner.get('tithi', [{}])[0].get('name', 'N/A')
-    nakshatra = inner.get('nakshatra', [{}])[0].get('name', 'N/A')
-    
-    rk = inner.get('rahu_kaal', [{}])[0]
-    rahu_window = f"{rk.get('start')[11:16]} - {rk.get('end')[11:16]}"
-    
-    abhijit_window = "N/A"
-    for m in inner.get('muhurta', []):
-        if m.get('name') == 'Abhijit':
-            abhijit_window = f"{m.get('start')[11:16]} - {m.get('end')[11:16]}"
-            break
+    # Deep Defensive Check 1: Ensure vedic data exists
+    if not vedic or 'data' not in vedic:
+        return "❌ **Vedic Data Error:** API returned an empty response. Check Prokerala Credentials/Quota."
 
-    planets_info = inner.get('planetary_strength', {}).get('planets', [])
-    strength_map = {p['name']: p.get('shadbala', {}).get('ratio', 1.0) for p in planets_info}
+    inner = vedic.get('data', {})
+    
+    # Deep Defensive Check 2: Safe Tithi/Nakshatra extraction
+    tithi_data = inner.get('tithi', [])
+    tithi = tithi_data[0].get('name', 'N/A') if tithi_data else "N/A"
+    
+    nakshatra_data = inner.get('nakshatra', [])
+    nakshatra = nakshatra_data[0].get('name', 'N/A') if nakshatra_data else "N/A"
+    
+    # Safe Rahu/Abhijit Slicing
+    rahu_data = inner.get('rahu_kaal', [])
+    rahu_window = "N/A"
+    if rahu_data and 'start' in rahu_data[0]:
+        try:
+            rahu_window = f"{rahu_data[0]['start'][11:16]} - {rahu_data[0]['end'][11:16]}"
+        except: pass
 
     def calc_stars(planet_name):
         ratio = strength_map.get(planet_name, 1.0)
