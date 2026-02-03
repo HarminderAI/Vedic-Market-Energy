@@ -6,6 +6,7 @@ import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import finnhub
+import csv
 
 # Start the 'heartbeat' server
 keep_alive()
@@ -26,24 +27,31 @@ def get_prokerala_token():
     response = requests.post(url, data=data)
     return response.json().get('access_token')
 
+def log_prediction(sector_map):
+    """Saves 4 and 5 star predictions for weekend review."""
+    file_path = 'backtest_log.csv'
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    # Filter for high conviction only
+    top_picks = [s for s, stars in sector_map.items() if stars >= 4]
+    
+    file_exists = os.path.isfile(file_path)
+    with open(file_path, mode='a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['Date', 'Top_Sectors'])
+        writer.writerow([today, ",".join(top_picks)])
+
 def get_market_intelligence():
-    """Fetches Technicals and Sentiment with robust error handling."""
     try:
         nifty = yf.download("^NSEI", period="60d", interval="1d", progress=False)
         vix = yf.download("^INDIAVIX", period="5d", interval="1d", progress=False)
-        
         nifty['RSI'] = ta.rsi(nifty['Close'], length=14)
-        
-        # Safe extraction to prevent NoneType errors
         latest_rsi = float(nifty['RSI'].iloc[-1]) if not nifty['RSI'].empty else 50.0
         latest_vix = float(vix['Close'].iloc[-1]) if not vix.empty else 15.0
-        
         sentiment_data = finnhub_client.news_sentiment('AAPL')
         bullish_pct = sentiment_data.get('sentiment', {}).get('bullishPercent', 0.5)
-        
         return round(latest_rsi, 2), round(latest_vix, 2), bullish_pct
-    except Exception as e:
-        print(f"Market Data Warning: {e}")
+    except:
         return 50.0, 15.0, 0.5
 
 def get_vedic_data(token):
@@ -62,21 +70,17 @@ def generate_ultimate_report(vedic, rsi, vix, sentiment):
     tithi = inner.get('tithi', [{}])[0].get('name', 'N/A')
     nakshatra = inner.get('nakshatra', [{}])[0].get('name', 'N/A')
     
-    # 🚫 Rahu Kaal (Safe Extraction)
-    rahu_window = "N/A"
-    if inner.get('rahu_kaal'):
-        rk = inner.get('rahu_kaal')[0]
-        rahu_window = f"{rk.get('start')[11:16]} - {rk.get('end')[11:16]}"
-
-    # ✅ Abhijit Muhurat (The Golden Window)
+    # Time Windows
+    rk = inner.get('rahu_kaal', [{}])[0]
+    rahu_window = f"{rk.get('start')[11:16]} - {rk.get('end')[11:16]}"
+    
     abhijit_window = "N/A"
-    muhurtas = inner.get('muhurta', [])
-    for m in muhurtas:
+    for m in inner.get('muhurta', []):
         if m.get('name') == 'Abhijit':
             abhijit_window = f"{m.get('start')[11:16]} - {m.get('end')[11:16]}"
             break
 
-    # ✨ Shadbala Potency Filter
+    # 9-Sector Logic
     planets_info = inner.get('planetary_strength', {}).get('planets', [])
     strength_map = {p['name']: p.get('shadbala', {}).get('ratio', 1.0) for p in planets_info}
 
@@ -88,24 +92,23 @@ def generate_ultimate_report(vedic, rsi, vix, sentiment):
         return min(max(score, 1), 5)
 
     sector_map = {
-        "☀️ PSU (Sun)": calc_stars("Sun"),
-        "🌙 FMCG (Moon)": calc_stars("Moon"),
-        "⚔️ Infra (Mars)": calc_stars("Mars"),
-        "💻 IT/Tech (Mercury)": calc_stars("Mercury"),
-        "🏦 Banking (Jupiter)": calc_stars("Jupiter"),
-        "💎 Luxury/Auto (Venus)": calc_stars("Venus"),
-        "⚒️ Metals (Saturn)": calc_stars("Saturn"),
-        "🚀 NewTech (Rahu)": calc_stars("Rahu"),
-        "💊 Pharma (Ketu)": calc_stars("Ketu")
+        "☀️ PSU": calc_stars("Sun"), "🌙 FMCG": calc_stars("Moon"),
+        "⚔️ Infra": calc_stars("Mars"), "💻 IT": calc_stars("Mercury"),
+        "🏦 Banking": calc_stars("Jupiter"), "💎 Auto": calc_stars("Venus"),
+        "⚒️ Metals": calc_stars("Saturn"), "🚀 Tech": calc_stars("Rahu"),
+        "💊 Pharma": calc_stars("Ketu")
     }
+    
+    # --- LOGGING FOR BACKTEST ---
+    log_prediction(sector_map)
+    
     heatmap = "\n".join([f"{k}: {'⭐' * v}" for k, v in sector_map.items()])
 
     report = (
         f"🏛️ *Vedic Institutional Quant* 🏛️\n"
         f"📅 {datetime.datetime.now().strftime('%d %b %Y')}\n"
         f"--------------------------\n"
-        f"🌟 *ABHIJIT MUHURAT:* {abhijit_window}\n"
-        f"🚫 *RAHU KAAL:* {rahu_window}\n"
+        f"🌟 *ABHIJIT:* {abhijit_window} | 🚫 *RAHU:* {rahu_window}\n"
         f"--------------------------\n"
         f"✨ {tithi} | ⭐ {nakshatra}\n"
         f"📊 RSI: {rsi} | VIX: {vix}\n"
@@ -127,9 +130,8 @@ def main():
         
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": report, "parse_mode": "Markdown"})
-        print("Success: Final Institutional Report Sent.")
     except Exception as e:
-        print(f"Error in Main Execution: {e}")
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
