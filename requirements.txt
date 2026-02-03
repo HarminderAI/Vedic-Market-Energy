@@ -1,3 +1,5 @@
+python-dateutil
+pytz
 flask
 gunicorn
 yfinance>=0.2.51
@@ -10,3 +12,7 @@ google-auth>=2.25.0
 google-auth-oauthlib>=1.2.0
 google-auth-httplib2>=0.2.0
 nltk
+numpy
+beautifulsoup4
+curl_cffi
+multitasking
