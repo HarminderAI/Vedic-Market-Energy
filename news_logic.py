@@ -1,27 +1,21 @@
-# ==========================================================
-# 📰 NEWS LOGIC — CONTEXTUAL SENTIMENT MODULE (PRODUCTION)
-# ==========================================================
-
 import os
 import requests
+import nltk
 from textblob import TextBlob
 from datetime import datetime, timedelta
 
-# ----------------------------------------------------------
+# ==========================================================
 # NLTK BOOTSTRAP (RENDER SAFE)
-# ----------------------------------------------------------
-# Render containers do NOT persist NLTK data.
-# This prevents random LookupError crashes on cold starts.
+# ==========================================================
 
-import nltk
 try:
     nltk.data.find("tokenizers/punkt_tab")
 except LookupError:
     nltk.download("punkt_tab")
 
-# ----------------------------------------------------------
+# ==========================================================
 # CONFIG
-# ----------------------------------------------------------
+# ==========================================================
 
 GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 
@@ -30,34 +24,31 @@ DEFAULT_SUBJECTIVITY = 0.0
 
 MAX_ARTICLES = 3
 TIMEOUT = 10
-HOURS_BACK = 12
 
 KEYWORDS = [
     "nifty", "sensex", "market", "stocks", "equity",
-    "rbi", "inflation", "gdp", "rates", "economy"
+    "rbi", "inflation", "gdp", "rates", "economy",
+    "fed", "global", "commodities"
 ]
 
-# ----------------------------------------------------------
+# ==========================================================
 # CORE FUNCTION
-# ----------------------------------------------------------
+# ==========================================================
 
 def fetch_market_news(
     query="Nifty OR Indian Stock Market",
     country="in",
     lang="en",
     max_articles=MAX_ARTICLES,
-    hours_back=HOURS_BACK
+    hours_back=12
 ):
     """
-    Fetches recent macro market news and computes:
-
     Returns:
-        sentiment (float)     -> avg polarity
-        subjectivity (float)  -> avg subjectivity
-        headlines (list[str]) -> filtered headlines
+        sentiment (float)
+        subjectivity (float)
+        headlines (list[str])
     """
 
-    # News must NEVER crash the bot
     if not GNEWS_API_KEY:
         return DEFAULT_SENTIMENT, DEFAULT_SUBJECTIVITY, []
 
@@ -88,7 +79,7 @@ def fetch_market_news(
             if not title:
                 continue
 
-            # Keyword noise filter
+            # Noise filter — ignore irrelevant micro news
             if not any(k in title.lower() for k in KEYWORDS):
                 continue
 
@@ -106,18 +97,14 @@ def fetch_market_news(
         return avg_sentiment, avg_subjectivity, headlines
 
     except Exception:
-        # Absolute safety: news is CONTEXT, never a failure point
+        # News must NEVER crash the bot
         return DEFAULT_SENTIMENT, DEFAULT_SUBJECTIVITY, []
 
-# ----------------------------------------------------------
+# ==========================================================
 # FORMATTER (TELEGRAM FRIENDLY)
-# ----------------------------------------------------------
+# ==========================================================
 
 def format_news_block(sentiment, subjectivity, headlines):
-    """
-    Formats news output for Telegram readability
-    """
-
     if not headlines:
         return "📰 News: Neutral (No relevant macro headlines)"
 
