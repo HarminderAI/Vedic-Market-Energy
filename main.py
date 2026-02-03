@@ -28,26 +28,38 @@ def get_panchang_data(token):
     """Fetches real-time Tithi and Nakshatra from Prokerala."""
     url = "https://api.prokerala.com/v2/astrology/panchang"
     params = {
-        'datetime': datetime.datetime.now().isoformat(),
-        'coordinates': '23.1765,75.7885',
+        # Using a slightly simpler date format for the API
+        'datetime': datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S+05:30'),
+        'coordinates': '23.1765,75.7885', # Ujjain
         'ayanamsa': 1
     }
     headers = {'Authorization': f'Bearer {token}'}
     response = requests.get(url, params=params, headers=headers)
+    
+    # DEBUG: This will show us the REAL error in Render Logs
+    print("RAW API RESPONSE:", response.text) 
+    
     return response.json()
 
 def generate_market_report(data):
-    # Dig into the JSON structure carefully
-    panchang_data = data.get('data', {}).get('panchang', {})
+    # Digging into the V2 structure
+    # The actual data is usually inside 'data' -> 'panchang'
+    inner_data = data.get('data', {})
+    panchang = inner_data.get('panchang', {})
     
-    # Prokerala V2 usually returns these as lists
-    # We grab the first item [0] and then the 'name'
-    tithis = panchang_data.get('tithi', [])
-    nakshatras = panchang_data.get('nakshatra', [])
+    # Safely extract names from the lists
+    tithi_list = panchang.get('tithi', [])
+    nakshatra_list = panchang.get('nakshatra', [])
     
-    tithi = tithis[0].get('name', 'Unknown') if tithis else 'Unknown'
-    nakshatra = nakshatras[0].get('name', 'Unknown') if nakshatras else 'Unknown'
+    tithi = tithi_list[0].get('name', 'Unknown') if tithi_list else "Unknown"
+    nakshatra = nakshatra_list[0].get('name', 'Unknown') if nakshatra_list else "Unknown"
     
+    # If the API returned an error, the 'tithi' will be 'Unknown'
+    # Check if there is an error message in the response
+    if 'errors' in data:
+        tithi = "API Error"
+        nakshatra = data['errors'][0].get('message', 'Check Logs')
+
     weekday_idx = datetime.datetime.now().weekday()
 
     # Sector Ratings (out of 5 stars)
