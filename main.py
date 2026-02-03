@@ -54,6 +54,37 @@ def get_prokerala_token():
     data = {'grant_type': 'client_credentials', 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET}
     return requests.post(url, data=data).json().get('access_token')
 
+def get_market_intelligence():
+    try:
+        # Download data
+        nifty = yf.download("^NSEI", period="5d", interval="1d", progress=False)
+        vix = yf.download("^INDIAVIX", period="5d", interval="1d", progress=False)
+        
+        # Check if DataFrames are empty or None
+        if nifty is None or nifty.empty or len(nifty) < 1:
+            print("⚠️ Nifty data not found, using defaults.")
+            latest_rsi = 50.0
+        else:
+            nifty['RSI'] = ta.rsi(nifty['Close'], length=14)
+            # Safe check for RSI column
+            if 'RSI' in nifty.columns and not nifty['RSI'].empty:
+                latest_rsi = float(nifty['RSI'].iloc[-1])
+            else:
+                latest_rsi = 50.0
+
+        if vix is None or vix.empty or len(vix) < 1:
+            print("⚠️ VIX data not found, using defaults.")
+            latest_vix = 15.0
+        else:
+            latest_vix = float(vix['Close'].iloc[-1])
+
+        # Return the values
+        return round(latest_rsi, 2), round(latest_vix, 2)
+        
+    except Exception as e:
+        print(f"Market Intelligence Error: {e}")
+        return 50.0, 15.0  # Fallback values to prevent bot crash
+
 def calculate_eod_performance():
     try:
         tickers = list(NSE_SECTOR_MAP.values())
