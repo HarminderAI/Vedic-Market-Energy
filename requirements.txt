@@ -3,3 +3,4 @@ flask
 gunicorn
 yfinance
 pandas
+finnhub-python
