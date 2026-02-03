@@ -1,38 +1,128 @@
-import requests
+# ==========================================================
+# 📰 NEWS LOGIC — CONTEXTUAL SENTIMENT MODULE (FINAL)
+# ==========================================================
+
 import os
+import requests
 from textblob import TextBlob
+from datetime import datetime, timedelta
 
-# GNews API Setup (Get your free key at gnews.io)
-GNEWS_API_KEY = os.environ.get('GNEWS_API_KEY')
+# ----------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------
 
-def fetch_market_news(query="Nifty 50"):
-    """Fetches top 5 relevant news articles for the given query."""
-    url = f"https://gnews.io/api/v4/search?q={query}&lang=en&country=in&max=5&apikey={GNEWS_API_KEY}"
-    
+GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
+
+DEFAULT_SENTIMENT = 0.0
+DEFAULT_SUBJECTIVITY = 0.0
+
+MAX_ARTICLES = 3
+TIMEOUT = 10
+
+KEYWORDS = [
+    "nifty", "sensex", "market", "stocks", "equity",
+    "rbi", "inflation", "gdp", "rates", "economy"
+]
+
+# ----------------------------------------------------------
+# CORE FUNCTION
+# ----------------------------------------------------------
+
+def fetch_market_news(
+    query="Nifty OR Indian Stock Market",
+    country="in",
+    lang="en",
+    max_articles=MAX_ARTICLES,
+    hours_back=12
+):
+    """
+    Fetches recent market news and computes:
+    - average sentiment polarity
+    - average subjectivity
+    - filtered headlines
+
+    Returns:
+        sentiment (float)
+        subjectivity (float)
+        headlines (list[str])
+    """
+
+    if not GNEWS_API_KEY:
+        return DEFAULT_SENTIMENT, DEFAULT_SUBJECTIVITY, []
+
     try:
-        response = requests.get(url)
-        articles = response.json().get('articles', [])
-        
-        news_summary = []
-        total_sentiment = 0
-        
+        published_after = (
+            datetime.utcnow() - timedelta(hours=hours_back)
+        ).isoformat("T") + "Z"
+
+        url = (
+            "https://gnews.io/api/v4/search"
+            f"?q={query}"
+            f"&lang={lang}"
+            f"&country={country}"
+            f"&max={max_articles}"
+            f"&from={published_after}"
+            f"&apikey={GNEWS_API_KEY}"
+        )
+
+        response = requests.get(url, timeout=TIMEOUT)
+        articles = response.json().get("articles", [])
+
+        sentiments = []
+        subjectivities = []
+        headlines = []
+
         for art in articles:
-            title = art['title']
-            # Perform quick sentiment analysis on the headline
-            analysis = TextBlob(title)
-            sentiment = analysis.sentiment.polarity
-            
-            total_sentiment += sentiment
-            news_summary.append({
-                "title": title,
-                "url": art['url'],
-                "sentiment": sentiment
-            })
-            
-        # Average sentiment (Bullish if > 0.1, Bearish if < -0.1)
-        avg_sentiment = total_sentiment / len(articles) if articles else 0
-        return news_summary, round(avg_sentiment, 2)
-        
-    except Exception as e:
-        print(f"News API Error: {e}")
-        return [], 0
+            title = art.get("title", "")
+            if not title:
+                continue
+
+            # Keyword noise filter
+            if not any(k in title.lower() for k in KEYWORDS):
+                continue
+
+            blob = TextBlob(title)
+            sentiments.append(blob.sentiment.polarity)
+            subjectivities.append(blob.sentiment.subjectivity)
+            headlines.append(title)
+
+        if not sentiments:
+            return DEFAULT_SENTIMENT, DEFAULT_SUBJECTIVITY, []
+
+        avg_sentiment = round(sum(sentiments) / len(sentiments), 2)
+        avg_subjectivity = round(sum(subjectivities) / len(subjectivities), 2)
+
+        return avg_sentiment, avg_subjectivity, headlines
+
+    except Exception:
+        # News must NEVER crash the bot
+        return DEFAULT_SENTIMENT, DEFAULT_SUBJECTIVITY, []
+
+# ----------------------------------------------------------
+# FORMATTER (TELEGRAM FRIENDLY)
+# ----------------------------------------------------------
+
+def format_news_block(sentiment, subjectivity, headlines):
+    if not headlines:
+        return "📰 News: Neutral (No relevant macro headlines)"
+
+    mood = (
+        "🟢 Positive" if sentiment > 0.15 else
+        "🔴 Negative" if sentiment < -0.15 else
+        "🟡 Neutral"
+    )
+
+    tone = (
+        "🔥 Opinion-Heavy" if subjectivity > 0.6 else
+        "📘 Factual"
+    )
+
+    lines = [
+        f"📰 News Sentiment: {sentiment:+.2f} ({mood})",
+        f"🧠 News Tone: {tone} (Subjectivity: {subjectivity:.2f})"
+    ]
+
+    for h in headlines:
+        lines.append(f"• {h[:75]}")
+
+    return "\n".join(lines)
