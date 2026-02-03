@@ -8,9 +8,6 @@ import pandas_ta as ta
 import finnhub
 import csv
 
-# Start the 'heartbeat' server
-keep_alive()
-
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
@@ -33,11 +30,17 @@ NSE_SECTOR_MAP = {
 }
 
 finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
+
+# --- CORE UTILITIES ---
+
 def send_telegram_msg(text):
     """Helper function to send messages to Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    requests.post(url, data=payload)
+    try:
+        requests.post(url, data=payload)
+    except Exception as e:
+        print(f"Telegram Post Error: {e}")
 
 def get_prokerala_token():
     url = "https://api.prokerala.com/token"
@@ -46,15 +49,19 @@ def get_prokerala_token():
     return response.json().get('access_token')
 
 def log_prediction(sector_map):
+    """Saves 4 and 5 star predictions for weekend review."""
     file_path = 'backtest_log.csv'
     today = datetime.datetime.now().strftime('%Y-%m-%d')
     top_picks = [s for s, stars in sector_map.items() if stars >= 4]
+    
     file_exists = os.path.isfile(file_path)
     with open(file_path, mode='a', newline='') as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(['Date', 'Top_Sectors'])
         writer.writerow([today, ",".join(top_picks)])
+
+# --- MARKET & VEDIC INTELLIGENCE ---
 
 def get_market_intelligence():
     try:
@@ -80,11 +87,12 @@ def get_vedic_data(token):
     headers = {'Authorization': f'Bearer {token}'}
     return requests.get(url, params=params, headers=headers).json()
 
+# --- EOD LOGIC ---
+
 def calculate_eod_performance():
     """Fetches daily % change for verification."""
     try:
         tickers = list(NSE_SECTOR_MAP.values())
-        # We use a 2-day period to ensure we have the previous close for pct_change
         data = yf.download(tickers, period="2d", interval="1d", progress=False)
         eod_msg = "📊 *EOD Market Verification* 📊\n"
         eod_msg += f"📅 {datetime.datetime.now().strftime('%d %b %Y')}\n\n"
@@ -99,6 +107,13 @@ def calculate_eod_performance():
         return eod_msg
     except Exception as e:
         return f"EOD Verification Error: {e}"
+
+def run_eod_flow():
+    """Callback function used by keep_alive.py to trigger EOD report."""
+    report = calculate_eod_performance()
+    send_telegram_msg(report)
+
+# --- REPORT GENERATION ---
 
 def generate_ultimate_report(vedic, rsi, vix, sentiment):
     inner = vedic.get('data', {})
@@ -152,26 +167,29 @@ def generate_ultimate_report(vedic, rsi, vix, sentiment):
     )
     return report
 
+# --- EXECUTION ---
+
+# 1. Start Heartbeat Server with EOD Callback
+keep_alive(run_eod_flow)
+
 def main():
     try:
-        # 1. MORNING REPORT
+        # 1. MORNING REPORT FLOW
         token = get_prokerala_token()
         rsi, vix, sentiment = get_market_intelligence()
         vedic = get_vedic_data(token)
         report = generate_ultimate_report(vedic, rsi, vix, sentiment)
         
-        # Use your helper function
         send_telegram_msg(report)
         print("Morning report sent successfully.")
 
     except Exception as e:
         error_message = f"❌ **Bot Error:** {str(e)}"
         print(error_message)
-        # Attempt to notify you of the failure
         try:
             send_telegram_msg(error_message)
         except:
-            pass # Avoid infinite loops if Telegram is down
+            pass
 
 if __name__ == "__main__":
     main()
