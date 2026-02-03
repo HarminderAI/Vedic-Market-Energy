@@ -42,50 +42,50 @@ def get_panchang_data(token):
     return response.json()
 
 def generate_market_report(data):
-    # Aggressive extraction logic
-    try:
-        # Access the panchang dictionary
-        p = data.get('data', {}).get('panchang', {})
-        
-        # Extract names with multi-layer fallbacks
-        tithi = p.get('tithi', [{}])[0].get('name', 'Determining...')
-        nakshatra = p.get('nakshatra', [{}])[0].get('name', 'Determining...')
-        
-        # If still unknown, check if the API uses a different key format
-        if tithi == 'Determining...' and 'tithi' in p:
-            tithi = p['tithi'][0]['name']
-            
-    except Exception as e:
-        print(f"Extraction Error: {e}")
-        tithi = "Calculation Pending"
-        nakshatra = "Calculation Pending"
+    # Based on your logs, the structure is: data -> tithi/nakshatra
+    # There is NO 'panchang' middle-man key in this specific response.
+    
+    inner_data = data.get('data', {})
+    
+    # 1. Extract Tithi
+    tithi_list = inner_data.get('tithi', [])
+    tithi = tithi_list[0].get('name', 'Determining...') if tithi_list else "Unknown"
+    
+    # 2. Extract Nakshatra
+    nakshatra_list = inner_data.get('nakshatra', [])
+    nakshatra = nakshatra_list[0].get('name', 'Determining...') if nakshatra_list else "Unknown"
+    
+    # 3. Extract Yoga (just for a better report)
+    yoga_list = inner_data.get('yoga', [])
+    yoga = yoga_list[0].get('name', 'N/A') if yoga_list else "N/A"
 
     weekday_idx = datetime.datetime.now().weekday()
     
-    # Sector Ratings
+    # --- Sector Logic ---
     it_rating = "⭐⭐"
     banking_rating = "⭐⭐"
     pharma_rating = "⭐⭐"
 
-    # Precise Logic for Feb 3 (Tuesday/Mars)
-    if nakshatra in ["Revati", "Ashlesha", "Jyeshtha"]: it_rating = "⭐⭐⭐⭐"
-    if tithi in ["Purnima", "Ekadashi", "Dwitiya"]: pharma_rating = "⭐⭐⭐⭐"
+    # Tuesday (Mars) + Magha (Ketu) focus:
+    # Magha is generally good for established 'Thrones' or large-cap Banking.
+    if nakshatra == "Magha": banking_rating = "⭐⭐⭐⭐"
+    if tithi == "Dwitiya": pharma_rating = "⭐⭐⭐"
 
     report = (
         f"🏛️ *Vedic Sector Heatmap* 🏛️\n"
         f"📅 Date: {datetime.datetime.now().strftime('%d %b %Y')}\n"
         f"✨ Tithi: {tithi} | ⭐ Nakshatra: {nakshatra}\n"
+        f"🌀 Yoga: {yoga}\n"
         f"--------------------------\n"
         f"💻 IT & Tech: {it_rating}\n"
         f"🏦 Banking/NBFC: {banking_rating}\n"
         f"💊 Pharmaceuticals: {pharma_rating}\n"
         f"--------------------------\n"
-        f"💡 *Astro-Tip:* Market energy is transitioning. Focus on defensive sectors.\n"
+        f"💡 *Astro-Tip:* Today's Magha Nakshatra favors legacy institutions and 'old money' sectors.\n"
         f"--------------------------\n"
         f"⚠️ *Disclaimer:* Educational Study only. Not SEBI advice."
     )
     return report
-
 def send_telegram_msg(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
