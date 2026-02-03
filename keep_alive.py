@@ -30,8 +30,8 @@ def home():
     return "Vedic Bot Heartbeat: Active", 200
 
 def run():
-    # Port 10000 is correct for Render Web Services
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 def keep_alive(callback):
     """
