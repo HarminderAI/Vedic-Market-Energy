@@ -42,32 +42,34 @@ def get_panchang_data(token):
     return response.json()
 
 def generate_market_report(data):
-    # This matches the 'panchang' key seen in your logs
-    panchang = data.get('data', {}).get('panchang', {})
-    
-    # Extracting names from the specific lists in your JSON
-    tithi_data = panchang.get('tithi', [])
-    nakshatra_data = panchang.get('nakshatra', [])
-    
-    # Get the name of the first item in the list
-    tithi = tithi_data[0].get('name', 'Unknown') if tithi_data else 'Unknown'
-    nakshatra = nakshatra_data[0].get('name', 'Unknown') if nakshatra_data else 'Unknown'
-    
-    weekday_idx = datetime.datetime.now().weekday()
+    # Aggressive extraction logic
+    try:
+        # Access the panchang dictionary
+        p = data.get('data', {}).get('panchang', {})
+        
+        # Extract names with multi-layer fallbacks
+        tithi = p.get('tithi', [{}])[0].get('name', 'Determining...')
+        nakshatra = p.get('nakshatra', [{}])[0].get('name', 'Determining...')
+        
+        # If still unknown, check if the API uses a different key format
+        if tithi == 'Determining...' and 'tithi' in p:
+            tithi = p['tithi'][0]['name']
+            
+    except Exception as e:
+        print(f"Extraction Error: {e}")
+        tithi = "Calculation Pending"
+        nakshatra = "Calculation Pending"
 
-    # Sector logic
+    weekday_idx = datetime.datetime.now().weekday()
+    
+    # Sector Ratings
     it_rating = "⭐⭐"
     banking_rating = "⭐⭐"
     pharma_rating = "⭐⭐"
 
-    if weekday_idx == 2 or nakshatra in ["Revati", "Jyeshtha"]: 
-        it_rating = "⭐⭐⭐⭐"
-    
-    if weekday_idx == 3 or nakshatra == "Pushya": 
-        banking_rating = "⭐⭐⭐⭐⭐"
-
-    if tithi in ["Purnima", "Ekadashi"]: 
-        pharma_rating = "⭐⭐⭐⭐⭐"
+    # Precise Logic for Feb 3 (Tuesday/Mars)
+    if nakshatra in ["Revati", "Ashlesha", "Jyeshtha"]: it_rating = "⭐⭐⭐⭐"
+    if tithi in ["Purnima", "Ekadashi", "Dwitiya"]: pharma_rating = "⭐⭐⭐⭐"
 
     report = (
         f"🏛️ *Vedic Sector Heatmap* 🏛️\n"
@@ -78,7 +80,7 @@ def generate_market_report(data):
         f"🏦 Banking/NBFC: {banking_rating}\n"
         f"💊 Pharmaceuticals: {pharma_rating}\n"
         f"--------------------------\n"
-        f"💡 *Astro-Tip:* Auspicious day for long-term SIPs.\n"
+        f"💡 *Astro-Tip:* Market energy is transitioning. Focus on defensive sectors.\n"
         f"--------------------------\n"
         f"⚠️ *Disclaimer:* Educational Study only. Not SEBI advice."
     )
