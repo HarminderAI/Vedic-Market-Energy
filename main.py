@@ -9,6 +9,8 @@ import pandas as pd
 import pandas_ta as ta
 import gspread
 from google.oauth2.service_account import Credentials
+import nltk
+nltk.download('punkt_tab')
 
 # Ops & modules
 from keep_alive import keep_alive
