@@ -143,16 +143,20 @@ def generate_ultimate_report(vedic, rsi, vix, sentiment):
             abhijit_window = f"{m.get('start')[11:16]} - {m.get('end')[11:16]}"
             break
 
-    # Fix: Define strength_map BEFORE the function that uses it
+   # 1. Fetch Shadbala Potency
     planets_info = inner.get('planetary_strength', {}).get('planets', [])
     strength_map = {p['name']: p.get('shadbala', {}).get('ratio', 1.0) for p in planets_info}
 
+    # 2. NEW DYNAMIC STAR LOGIC
     def calc_stars(planet_name):
         ratio = strength_map.get(planet_name, 1.0)
-        score = 3
-        if ratio > 1.2: score += 1
-        elif ratio < 0.8: score -= 1
-        return min(max(score, 1), 5)
+        
+        # More sensitive 5-point scale
+        if ratio >= 1.3: return 5
+        if ratio >= 1.1: return 4
+        if ratio <= 0.7: return 1
+        if ratio <= 0.9: return 2
+        return 3 # Base for ratio 0.91 to 1.09
 
     sector_map = {
         "☀️ PSU": calc_stars("Sun"), "🌙 FMCG": calc_stars("Moon"),
