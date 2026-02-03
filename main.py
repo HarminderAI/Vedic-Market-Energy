@@ -56,34 +56,32 @@ def get_prokerala_token():
 
 def get_market_intelligence():
     try:
-        # Download data
-        nifty = yf.download("^NSEI", period="5d", interval="1d", progress=False)
+        # 1. Attempt Downloads
+        nifty = yf.download("^NSEI", period="60d", interval="1d", progress=False)
         vix = yf.download("^INDIAVIX", period="5d", interval="1d", progress=False)
-        
-        # Check if DataFrames are empty or None
-        if nifty is None or nifty.empty or len(nifty) < 1:
-            print("⚠️ Nifty data not found, using defaults.")
-            latest_rsi = 50.0
-        else:
+
+        # 2. Defensive Check for Nifty (RSI)
+        if nifty is not None and not nifty.empty and len(nifty) > 14:
             nifty['RSI'] = ta.rsi(nifty['Close'], length=14)
-            # Safe check for RSI column
-            if 'RSI' in nifty.columns and not nifty['RSI'].empty:
-                latest_rsi = float(nifty['RSI'].iloc[-1])
-            else:
-                latest_rsi = 50.0
-
-        if vix is None or vix.empty or len(vix) < 1:
-            print("⚠️ VIX data not found, using defaults.")
-            latest_vix = 15.0
+            latest_rsi = float(nifty['RSI'].iloc[-1])
+            # Handle NaN RSI
+            if pd.isna(latest_rsi): latest_rsi = 50.0
         else:
-            latest_vix = float(vix['Close'].iloc[-1])
+            print("⚠️ Nifty data unavailable. Defaulting RSI to 50.")
+            latest_rsi = 50.0
 
-        # Return the values
+        # 3. Defensive Check for VIX
+        if vix is not None and not vix.empty:
+            latest_vix = float(vix['Close'].iloc[-1])
+        else:
+            print("⚠️ VIX data unavailable. Defaulting to 15.")
+            latest_vix = 15.0
+
         return round(latest_rsi, 2), round(latest_vix, 2)
-        
+
     except Exception as e:
-        print(f"Market Intelligence Error: {e}")
-        return 50.0, 15.0  # Fallback values to prevent bot crash
+        print(f"❌ Market Logic Error: {e}")
+        return 50.0, 15.0  # Safe Fallback values
 
 def calculate_eod_performance():
     try:
