@@ -238,7 +238,10 @@ def main():
     regime = market_regime_from_df(nifty)
     sectors = sector_rotation_from_df(nifty)
 
-    news_sentiment, headlines = fetch_market_news()
+    news_result = fetch_market_news()
+    news_sentiment = news_result[0]
+    headlines = news_result[1]
+    
     news_block = format_news_block(news_sentiment, headlines)
 
     # ----------------------------
