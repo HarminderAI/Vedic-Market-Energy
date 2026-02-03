@@ -4,6 +4,7 @@
 
 import os, json, datetime
 import requests
+import time
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
@@ -208,9 +209,112 @@ def compute_accuracy(limit=ANALYTICS_LOOKBACK):
     except Exception as e:
         return f"📈 Performance Snapshot\nError computing accuracy: {e}"
 
-# ==========================================================
-# STATE + VALIDATION + MAIN (UNCHANGED)
-# ==========================================================
-# (Identical to your last version — omitted here for brevity)
-# ==========================================================
+def main():
+    # ----------------------------
+    # Load previous state (if any)
+    # ----------------------------
+    rows = state_ws.get_all_records()
+    prev = None
+    if rows:
+        try:
+            prev = json.loads(rows[0]["value"])
+        except:
+            prev = None
 
+    # ----------------------------
+    # Download market data ONCE
+    # ----------------------------
+    nifty = safe_download("^NSEI", 80)
+    vix = safe_download("^INDIAVIX", 10)
+
+    if nifty is None:
+        send_msg("❌ Market data unavailable. Morning report skipped.")
+        return
+
+    # ----------------------------
+    # Compute metrics
+    # ----------------------------
+    rsi, vix_val, vol_ok, close = market_metrics_from_df(nifty, vix)
+    regime = market_regime_from_df(nifty)
+    sectors = sector_rotation_from_df(nifty)
+
+    news_sentiment, headlines = fetch_market_news()
+    news_block = format_news_block(news_sentiment, headlines)
+
+    # ----------------------------
+    # Score & Bias
+    # ----------------------------
+    score = (
+        (20 if rsi > 55 else 10) +
+        (20 if vol_ok else 10) +
+        (10 if news_sentiment > 0 else 5)
+    )
+
+    bias = "BULLISH" if score >= 65 else "NEUTRAL"
+
+    # ----------------------------
+    # Validate Yesterday (EOD)
+    # ----------------------------
+    if prev:
+        try:
+            delta = ((close - prev["nifty_close"]) / prev["nifty_close"]) * 100
+            if delta >= SUCCESS_THRESHOLD:
+                result = "CORRECT"
+            elif delta <= -SUCCESS_THRESHOLD:
+                result = "INCORRECT"
+            else:
+                result = "NO_EDGE"
+
+            history_ws.append_row([
+                prev["date"], prev["bias"], prev["score"],
+                prev["regime"], round(delta, 2), result
+            ])
+        except:
+            pass
+
+    # ----------------------------
+    # Save Today State
+    # ----------------------------
+    state_ws.clear()
+    state_ws.append_row([
+        "yesterday",
+        json.dumps({
+            "date": str(datetime.date.today()),
+            "bias": bias,
+            "score": score,
+            "regime": regime,
+            "nifty_close": close
+        })
+    ])
+
+    # ----------------------------
+    # Telegram Report
+    # ----------------------------
+    sector_text = "\n".join([f"• {k}: {v:+.2f}%" for k, v in sectors.items()])
+
+    send_msg(
+        "🏛️ Institutional Market Report\n"
+        f"RSI: {rsi}\n"
+        f"VIX: {vix_val}\n"
+        f"Volume Confirmed: {vol_ok}\n"
+        f"Regime: {regime}\n\n"
+        f"{news_block}\n\n"
+        f"Sector Rotation:\n{sector_text}\n\n"
+        f"Score: {score}/100\n"
+        f"Bias: {bias}\n\n"
+        "⚠️ Not SEBI Advice"
+    )
+
+if __name__ == "__main__":
+    # 1. Start the web server in a background thread
+    # This binds to Render's $PORT and prevents restarts
+    keep_alive(lambda: send_msg(compute_accuracy()))
+
+    # 2. Run the morning report exactly once
+    print("🚀 Running morning report...")
+    main()
+
+    # 3. Prevent Render from restarting the service
+    # This keeps the process alive indefinitely
+    while True:
+        time.sleep(3600)  # sleep in 1-hour intervals
