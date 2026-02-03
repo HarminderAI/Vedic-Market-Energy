@@ -42,40 +42,32 @@ def get_panchang_data(token):
     return response.json()
 
 def generate_market_report(data):
-    # Digging into the V2 structure
-    # The actual data is usually inside 'data' -> 'panchang'
-    inner_data = data.get('data', {})
-    panchang = inner_data.get('panchang', {})
+    # This matches the 'panchang' key seen in your logs
+    panchang = data.get('data', {}).get('panchang', {})
     
-    # Safely extract names from the lists
-    tithi_list = panchang.get('tithi', [])
-    nakshatra_list = panchang.get('nakshatra', [])
+    # Extracting names from the specific lists in your JSON
+    tithi_data = panchang.get('tithi', [])
+    nakshatra_data = panchang.get('nakshatra', [])
     
-    tithi = tithi_list[0].get('name', 'Unknown') if tithi_list else "Unknown"
-    nakshatra = nakshatra_list[0].get('name', 'Unknown') if nakshatra_list else "Unknown"
+    # Get the name of the first item in the list
+    tithi = tithi_data[0].get('name', 'Unknown') if tithi_data else 'Unknown'
+    nakshatra = nakshatra_data[0].get('name', 'Unknown') if nakshatra_data else 'Unknown'
     
-    # If the API returned an error, the 'tithi' will be 'Unknown'
-    # Check if there is an error message in the response
-    if 'errors' in data:
-        tithi = "API Error"
-        nakshatra = data['errors'][0].get('message', 'Check Logs')
-
     weekday_idx = datetime.datetime.now().weekday()
 
-    # Sector Ratings (out of 5 stars)
+    # Sector logic
     it_rating = "⭐⭐"
     banking_rating = "⭐⭐"
     pharma_rating = "⭐⭐"
 
-    # Logic remains the same
-    if weekday_idx == 2: it_rating = "⭐⭐⭐⭐"
-    if nakshatra in ["Revati", "Jyeshtha", "Ashlesha"]: it_rating = "⭐⭐⭐⭐⭐"
+    if weekday_idx == 2 or nakshatra in ["Revati", "Jyeshtha"]: 
+        it_rating = "⭐⭐⭐⭐"
     
-    if weekday_idx == 3: banking_rating = "⭐⭐⭐⭐"
-    if nakshatra == "Pushya": banking_rating = "⭐⭐⭐⭐⭐"
+    if weekday_idx == 3 or nakshatra == "Pushya": 
+        banking_rating = "⭐⭐⭐⭐⭐"
 
-    if weekday_idx == 0: pharma_rating = "⭐⭐⭐⭐"
-    if tithi in ["Purnima", "Ekadashi"]: pharma_rating = "⭐⭐⭐⭐⭐"
+    if tithi in ["Purnima", "Ekadashi"]: 
+        pharma_rating = "⭐⭐⭐⭐⭐"
 
     report = (
         f"🏛️ *Vedic Sector Heatmap* 🏛️\n"
@@ -86,9 +78,8 @@ def generate_market_report(data):
         f"🏦 Banking/NBFC: {banking_rating}\n"
         f"💊 Pharmaceuticals: {pharma_rating}\n"
         f"--------------------------\n"
-        f"💡 *Astro-Tip:* " + 
-        ("Avoid high-frequency trades today (Mercury unstable)." if weekday_idx == 2 and tithi == "Amavasya" else "Auspicious day for long-term SIPs.") +
-        f"\n--------------------------\n"
+        f"💡 *Astro-Tip:* Auspicious day for long-term SIPs.\n"
+        f"--------------------------\n"
         f"⚠️ *Disclaimer:* Educational Study only. Not SEBI advice."
     )
     return report
