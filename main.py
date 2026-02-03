@@ -27,6 +27,8 @@ SAFE_VIX = 15.0
 SUCCESS_THRESHOLD = 0.20  # %
 
 SECTORS = {
+    "PSU": "^CNXPSUBANK",
+    "Infra": "^CNXINFRA",
     "IT": "^CNXIT",
     "BANK": "^NSEBANK",
     "FMCG": "^CNXFMCG",
@@ -100,10 +102,10 @@ def fetch_news_sentiment():
 # METRICS FROM PRELOADED NIFTY
 # ==========================================================
 
-def market_metrics_from_df(nifty_df):
+def market_metrics_from_df(nifty_df, vix_df):
     try:
         if nifty_df is None or len(nifty_df) < 20:
-            return SAFE_RSI, False, None
+            return SAFE_RSI, SAFE_VIX, False, None
 
         rsi_series = ta.rsi(nifty_df["Close"], 14)
         rsi = SAFE_RSI if rsi_series is None or pd.isna(rsi_series.iloc[-1]) else round(float(rsi_series.iloc[-1]), 2)
@@ -113,9 +115,14 @@ def market_metrics_from_df(nifty_df):
 
         close = float(nifty_df["Close"].iloc[-1])
 
-        return rsi, vol_ok, close
+        if vix_df is None or vix_df.empty:
+            vix = SAFE_VIX
+        else:
+            vix = round(float(vix_df["Close"].iloc[-1]), 2)
+
+        return rsi, vix, vol_ok, close
     except:
-        return SAFE_RSI, False, None
+        return SAFE_RSI, SAFE_VIX, False, None
 
 # ==========================================================
 # MARKET REGIME FROM SAME DATA
@@ -141,20 +148,84 @@ def market_regime_from_df(nifty_df):
 
 def sector_rotation_from_df(nifty_df):
     out = {}
+
     try:
-        nifty_ret = (nifty_df["Close"].iloc[-1] / nifty_df["Close"].iloc[0] - 1) * 100
+        # Use last 20 trading days for apples-to-apples comparison
+        nifty_20d_ago = nifty_df["Close"].iloc[-20]
+        nifty_ret = (nifty_df["Close"].iloc[-1] / nifty_20d_ago - 1) * 100
     except:
         nifty_ret = 0.0
 
     for k, t in SECTORS.items():
         df = safe_download(t, 20)
-        if df is None:
+        if df is None or len(df) < 2:
             out[k] = 0.0
             continue
+
         sec_ret = (df["Close"].iloc[-1] / df["Close"].iloc[0] - 1) * 100
         out[k] = round(sec_ret - nifty_ret, 2)
 
     return out
+
+
+# ==========================================================
+# ACCURACY ANALYTICS
+# ==========================================================
+
+def compute_accuracy():
+    try:
+        records = history_ws.get_all_records()
+        if not records:
+            return "📈 Performance Snapshot\nNo data yet."
+
+        df = pd.DataFrame(records)
+        df = df[df["result"].isin(["CORRECT", "INCORRECT"])]
+
+        if df.empty:
+            return "📈 Performance Snapshot\nNo valid outcomes yet."
+
+        lines = ["📈 Performance Snapshot"]
+
+        overall_acc = round((df["result"] == "CORRECT").mean() * 100, 1)
+        lines.append(f"Overall Accuracy: {overall_acc}%\n")
+
+        lines.append("📌 Win-Rate by Bias")
+        for bias in ["BULLISH", "NEUTRAL"]:
+            sub = df[df["bias"] == bias]
+            if sub.empty:
+                lines.append(f"{bias}: No data")
+                continue
+            acc = round((sub["result"] == "CORRECT").mean() * 100, 1)
+            lines.append(f"{bias}: {acc}% (Trades: {len(sub)})")
+
+        lines.append("")
+        lines.append("📌 Win-Rate by Regime")
+        for regime in ["TRENDING", "RANGE", "VOLATILE", "UNKNOWN"]:
+            sub = df[df["regime"] == regime]
+            if sub.empty:
+                continue
+            acc = round((sub["result"] == "CORRECT").mean() * 100, 1)
+            lines.append(f"{regime}: {acc}% (Trades: {len(sub)})")
+
+        lines.append("")
+        lines.append("📌 Win-Rate by Score")
+        for low, high in [(60,64),(65,69),(70,74),(75,100)]:
+            sub = df[(df["score"] >= low) & (df["score"] <= high)]
+            if sub.empty:
+                continue
+            acc = round((sub["result"] == "CORRECT").mean() * 100, 1)
+            lines.append(f"{low}-{high}: {acc}% (Trades: {len(sub)})")
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        recent = df.sort_values("date").tail(30)
+        if len(recent) >= 5:
+            roll = round((recent["result"] == "CORRECT").mean() * 100, 1)
+            lines.append(f"\n📉 Rolling 30-Day Accuracy: {roll}%")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"📈 Performance Snapshot\nError computing accuracy: {e}"
 
 # ==========================================================
 # STATE HANDLING (SHEETS)
@@ -210,16 +281,18 @@ def main():
     prev = load_yesterday()
 
     nifty = safe_download("^NSEI", 80)
+    vix_df = safe_download("^INDIAVIX", 10)
     if nifty is None:
         return
 
-    rsi, vol_ok, close = market_metrics_from_df(nifty)
+    rsi, vix, vol_ok, close = market_metrics_from_df(nifty, vix_df)
     regime = market_regime_from_df(nifty)
     news = fetch_news_sentiment()
     sectors = sector_rotation_from_df(nifty)
 
     score = (
         (20 if rsi > 55 else 10) +
+        (15 if vix < 15 else 5) +
         (20 if vol_ok else 10) +
         (10 if news > 0 else 5)
     )
@@ -244,6 +317,7 @@ def main():
     send_msg(
         "🏛️ Institutional Market Report\n"
         f"RSI: {rsi}\n"
+        f"VIX: {vix}\n"
         f"Volume Confirmed: {vol_ok}\n"
         f"Regime: {regime}\n\n"
         f"Sector Rotation:\n{sector_text}\n\n"
@@ -251,6 +325,8 @@ def main():
         f"Bias: {bias}\n\n"
         "⚠️ Not SEBI Advice"
     )
+
+    send_msg(compute_accuracy())
 
 if __name__ == "__main__":
     main()
