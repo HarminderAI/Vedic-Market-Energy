@@ -4,10 +4,10 @@ import requests
 import datetime
 import time
 
-# Start the 'heartbeat' server
+# Start the 'heartbeat' server for Render 24/7 uptime
 keep_alive()
 
-# --- CONFIGURATION (From Secrets) ---
+# --- CONFIGURATION (From Render Environment Variables) ---
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 CLIENT_ID = os.environ.get('PROKERALA_CLIENT_ID')
@@ -24,83 +24,107 @@ def get_prokerala_token():
     response = requests.post(url, data=data)
     return response.json().get('access_token')
 
-def get_panchang_data(token):
-    """Fetches real-time Tithi and Nakshatra from Prokerala."""
+def get_combined_data(token):
+    """Fetches Panchang, Planet Positions, and Rahu Kaal in one go."""
+    # Using Ujjain coordinates for Indian Market standard
     url = "https://api.prokerala.com/v2/astrology/panchang"
     params = {
-        # Using a slightly simpler date format for the API
         'datetime': datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S+05:30'),
-        'coordinates': '23.1765,75.7885', # Ujjain
-        'ayanamsa': 1
+        'coordinates': '23.1765,75.7885', 
+        'ayanamsa': 1,
+        # We include extra dimensions for our advanced features
+        'la-dimension': 'planet-position,rahu-kaal' 
     }
     headers = {'Authorization': f'Bearer {token}'}
     response = requests.get(url, params=params, headers=headers)
-    
-    # DEBUG: This will show us the REAL error in Render Logs
-    print("RAW API RESPONSE:", response.text) 
-    
     return response.json()
 
 def generate_market_report(data):
-    # Based on your logs, the structure is: data -> tithi/nakshatra
-    # There is NO 'panchang' middle-man key in this specific response.
-    
     inner_data = data.get('data', {})
     
-    # 1. Extract Tithi
+    # 1. Extract Basic Panchang
     tithi_list = inner_data.get('tithi', [])
-    tithi = tithi_list[0].get('name', 'Determining...') if tithi_list else "Unknown"
-    
-    # 2. Extract Nakshatra
     nakshatra_list = inner_data.get('nakshatra', [])
-    nakshatra = nakshatra_list[0].get('name', 'Determining...') if nakshatra_list else "Unknown"
+    tithi = tithi_list[0].get('name', 'N/A') if tithi_list else "Unknown"
+    nakshatra = nakshatra_list[0].get('name', 'N/A') if nakshatra_list else "Unknown"
     
-    # 3. Extract Yoga (just for a better report)
-    yoga_list = inner_data.get('yoga', [])
-    yoga = yoga_list[0].get('name', 'N/A') if yoga_list else "N/A"
-
-    weekday_idx = datetime.datetime.now().weekday()
+    # 2. Extract Opening Sentiment (Moon Sign vs Day Lord)
+    moon_sign_list = inner_data.get('moon_sign', [{}])
+    moon_sign = moon_sign_list[0].get('name', 'Unknown')
+    weekday = datetime.datetime.now().weekday()
     
-    # --- Sector Logic ---
-    it_rating = "⭐⭐"
-    banking_rating = "⭐⭐"
-    pharma_rating = "⭐⭐"
+    positive_signs = {0: ["Cancer", "Taurus"], 1: ["Aries", "Leo"], 2: ["Virgo", "Taurus"], 
+                      3: ["Sagittarius", "Pisces"], 4: ["Libra", "Taurus"]}
+    
+    sentiment = "🚀 Bullish (Gap-Up)" if moon_sign in positive_signs.get(weekday, []) else "📉 Cautious (Gap-Down)"
+    if moon_sign == "Unknown": sentiment = "⚖️ Sideways/Neutral"
 
-    # Tuesday (Mars) + Magha (Ketu) focus:
-    # Magha is generally good for established 'Thrones' or large-cap Banking.
-    if nakshatra == "Magha": banking_rating = "⭐⭐⭐⭐"
-    if tithi == "Dwitiya": pharma_rating = "⭐⭐⭐"
+    # 3. Extract Rahu Kaal Window
+    rk_list = inner_data.get('rahu_kaal', [{}])
+    try:
+        rk_start = datetime.datetime.fromisoformat(rk_list[0].get('start')).strftime('%I:%M %p')
+        rk_end = datetime.datetime.fromisoformat(rk_list[0].get('end')).strftime('%I:%M %p')
+        rahu_kaal = f"{rk_start} - {rk_end}"
+    except:
+        rahu_kaal = "Check Daily Chart"
 
+    # 4. Mercury Retrograde Check
+    planets = inner_data.get('planet_positions', [])
+    mercury_vakra = any(p.get('name') == 'Mercury' and p.get('is_retrograde') for p in planets)
+
+    # 5. Advanced 9-Sector Score Logic
+    sectors = {
+        "PSU & Energy (Sun)": 3, "FMCG (Moon)": 3, "Banking (Jupiter)": 3,
+        "IT & Tech (Mercury)": 3, "Real Estate (Mars)": 3, "Luxury (Venus)": 3,
+        "Metals (Saturn)": 3, "Aviation (Rahu)": 3, "Pharma (Ketu)": 3
+    }
+
+    # Dynamic Adjustments
+    if nakshatra == "Magha": 
+        sectors["Banking (Jupiter)"] += 1
+        sectors["Pharma (Ketu)"] += 2
+    if mercury_vakra: 
+        sectors["IT & Tech (Mercury)"] -= 1
+    if nakshatra in ["Pushya", "Anuradha"]: 
+        sectors["Metals (Saturn)"] += 2
+
+    heatmap_text = ""
+    for sector, score in sectors.items():
+        heatmap_text += f"{sector}: {'⭐' * min(score, 5)}\n"
+
+    # 6. Final Report Assembly
     report = (
-        f"🏛️ *Vedic Sector Heatmap* 🏛️\n"
+        f"🏛️ *Vedic Financial Heatmap* 🏛️\n"
         f"📅 Date: {datetime.datetime.now().strftime('%d %b %Y')}\n"
         f"✨ Tithi: {tithi} | ⭐ Nakshatra: {nakshatra}\n"
-        f"🌀 Yoga: {yoga}\n"
+        f"🌙 Moon Sign: {moon_sign}\n"
         f"--------------------------\n"
-        f"💻 IT & Tech: {it_rating}\n"
-        f"🏦 Banking/NBFC: {banking_rating}\n"
-        f"💊 Pharmaceuticals: {pharma_rating}\n"
+        f"🎭 *Opening Sentiment:* {sentiment}\n"
+        f"🚫 *Rahu Kaal:* {rahu_kaal}\n"
         f"--------------------------\n"
-        f"💡 *Astro-Tip:* Today's Magha Nakshatra favors legacy institutions and 'old money' sectors.\n"
+        f"{heatmap_text}"
         f"--------------------------\n"
-        f"⚠️ *Disclaimer:* Educational Study only. Not SEBI advice."
+        f"💡 *Astro-Tip:* " + ("⚠️ Mercury Retrograde active. Watch for tech glitches." if mercury_vakra else "Favorable day for institutional buying.") +
+        f"\n--------------------------\n"
+        f"⚠️ *Educational only. Not SEBI advice.*"
     )
     return report
+
 def send_telegram_msg(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     requests.post(url, data=payload)
 
 def main():
-    print("Starting Vedic Finance Bot...")
+    print("Vedic Bot Processing...")
     try:
         token = get_prokerala_token()
-        data = get_panchang_data(token)
+        data = get_combined_data(token)
         report = generate_market_report(data)
         send_telegram_msg(report)
-        print("Success! Report sent to Telegram.")
+        print("Success! Automated report deployed.")
     except Exception as e:
-        print(f"Error occurred: {e}")
+        print(f"Deployment Error: {e}")
 
 if __name__ == "__main__":
     main()
