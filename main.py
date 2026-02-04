@@ -23,7 +23,7 @@ def ist_now():
     return datetime.datetime.now(IST)
 
 def ist_today():
-    return str(ist_now().date())
+    return ist_now().date().isoformat()
 
 # ==========================================================
 # CONFIG
@@ -52,7 +52,7 @@ def send_msg(text):
         print("Telegram error:", e)
 
 # ==========================================================
-# GOOGLE SHEETS — HARDENED
+# GOOGLE SHEETS — SAFE ACCESS
 # ==========================================================
 def sheet_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -62,30 +62,29 @@ def sheet_client():
 gc = sheet_client()
 sheet = gc.open_by_key(GOOGLE_SHEET_ID)
 
-def safe_sheet(ws_name, headers):
+def safe_sheet(name, headers):
     global gc, sheet
     try:
-        return sheet.worksheet(ws_name)
+        return sheet.worksheet(name)
     except:
         gc = sheet_client()
         sheet = gc.open_by_key(GOOGLE_SHEET_ID)
         try:
-            return sheet.worksheet(ws_name)
+            return sheet.worksheet(name)
         except:
-            ws = sheet.add_worksheet(ws_name, rows=200, cols=20)
+            ws = sheet.add_worksheet(name, rows=200, cols=20)
             ws.append_row(headers)
             return ws
 
-state_ws   = safe_sheet("state", ["key","value"])
-stocks_ws  = safe_sheet("stocks", ["symbol","score","bucket","size","health","sector"])
+state_ws   = safe_sheet("state",   ["key","value"])
+stocks_ws  = safe_sheet("stocks",  ["symbol","score","bucket","size","health","sector"])
 history_ws = safe_sheet("history", ["date","symbol","event","detail"])
 
 # ==========================================================
-# MARKET DATA
+# MARKET DATA (2026 SAFE)
 # ==========================================================
 def safe_download(ticker, days=80):
     try:
-        # auto_adjust=True ensures splits/dividends are handled
         df = yf.download(
             ticker,
             period=f"{days}d",
@@ -96,7 +95,6 @@ def safe_download(ticker, days=80):
         if df is None or df.empty:
             return None
 
-        # Robust MultiIndex flattening (2026-safe)
         if df.columns.nlevels > 1:
             df.columns = df.columns.get_level_values(0)
 
@@ -124,7 +122,7 @@ def batch_download(tickers):
     return out
 
 # ==========================================================
-# INDICATORS
+# INDICATORS — SAFE LAST VALID
 # ==========================================================
 def trend_health(df):
     close = df["Close"].dropna()
@@ -151,6 +149,7 @@ def score_stock(df):
 
     health, _ = trend_health(df)
     score = 30 if rsi > 60 else 15 if rsi > 50 else 5
+
     if health == "OVERSTRETCHED":
         score -= 20
     elif health == "HEALTHY":
@@ -168,7 +167,7 @@ def position_size(bucket):
     return {"STRONG_BUY":0.25,"BUY":0.15,"WATCHLIST":0.05}.get(bucket,0)
 
 # ==========================================================
-# MORNING ENGINE (FIXED STATE READ)
+# MORNING ENGINE (NO DUPLICATES)
 # ==========================================================
 def morning_run():
     send_msg("🌅 Morning Scan Started")
@@ -181,11 +180,10 @@ def morning_run():
         "SUNPHARMA.NS":"PHARMA"
     }
 
-    # ---- SAFE STATE READ (POSITIONAL) ----
+    # ---- LOAD PREVIOUS HEALTH ----
     prev_health = {}
-    rows = state_ws.get_all_values()[1:]  # skip header
-    for r in rows:
-        if len(r) >= 2 and r[0] == "health_state":
+    for r in state_ws.get_all_values()[1:]:
+        if r[0] == "health_state":
             try:
                 prev_health = json.loads(r[1]).get("health", {})
             except:
@@ -196,7 +194,10 @@ def morning_run():
 
     for sym, df in data.items():
         score, health = score_stock(df)
-        allow = health == "HEALTHY" or (prev_health.get(sym) == "OVERSTRETCHED" and health == "HEALTHY")
+        allow = (
+            health == "HEALTHY" or
+            (prev_health.get(sym) == "OVERSTRETCHED" and health == "HEALTHY")
+        )
         if allow:
             ranked.append({
                 "symbol": sym,
@@ -208,16 +209,19 @@ def morning_run():
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
 
-    total_alloc = 0
+    total_alloc = 0.0
     sector_alloc = defaultdict(float)
     final = []
 
     for s in ranked:
         if len(final) == 5:
             break
+
         size = position_size(s["bucket"])
-        if size == 0: continue
-        if total_alloc + size > GLOBAL_EXPOSURE_CAP: continue
+        if size == 0:
+            continue
+        if total_alloc + size > GLOBAL_EXPOSURE_CAP:
+            continue
         if sector_alloc[s["sector"]] + size > SECTOR_CAP:
             send_msg(f"⚠️ Sector Concentration Alert: {s['sector']}")
             continue
@@ -227,22 +231,22 @@ def morning_run():
         s["size"] = round(size * 100, 1)
         final.append(s)
 
-    # ---- SAVE STATE (NO CLEAR) ----
-    found = False
-    for i, r in enumerate(rows, start=2):
-        if r[0] == "health_state":
-            state_ws.update_cell(i, 2, json.dumps({
-                "date": ist_today(),
-                "health": {s["symbol"]: s["health"] for s in ranked}
-            }))
-            found = True
-            break
-    if not found:
-        state_ws.append_row([
-            "health_state",
-            json.dumps({"date": ist_today(), "health": {s["symbol"]: s["health"] for s in ranked}})
-        ])
+    # ---- SAVE HEALTH STATE (NO CLEAR) ----
+    health_payload = {
+        "date": ist_today(),
+        "health": {s["symbol"]: s["health"] for s in ranked}
+    }
 
+    updated = False
+    for i, r in enumerate(state_ws.get_all_values()[1:], start=2):
+        if r[0] == "health_state":
+            state_ws.update_cell(i, 2, json.dumps(health_payload))
+            updated = True
+            break
+    if not updated:
+        state_ws.append_row(["health_state", json.dumps(health_payload)])
+
+    # ---- SAVE STOCKS ----
     stocks_ws.clear()
     stocks_ws.append_row(["symbol","score","bucket","size","health","sector"])
     for s in final:
@@ -254,11 +258,14 @@ def morning_run():
 
     msg = [f"🏛️ Top Picks — {ist_today()}", ""]
     for s in final:
-        msg.append(f"• {s['symbol']} | {s['bucket']} | {s['score']} | {s['size']}% | {s['health']}")
+        msg.append(
+            f"• {s['symbol']} | {s['bucket']} | {s['score']} | {s['size']}% | {s['health']}"
+        )
+
     send_msg("\n".join(msg))
 
 # ==========================================================
-# EOD ENGINE
+# EOD ENGINE (ONCE PER DAY — KEEP_ALIVE HANDLES TIMING)
 # ==========================================================
 def eod_run():
     send_msg("📊 EOD Analytics Ready")
@@ -275,10 +282,11 @@ def eod_run():
             history_ws.append_row([ist_today(), sym, "EXIT", f"{prev[sym]} → {score}"])
 
 # ==========================================================
-# BOOTSTRAP
+# BOOTSTRAP (NON-BLOCKING, RENDER SAFE)
 # ==========================================================
 if __name__ == "__main__":
     keep_alive(eod_callback=eod_run)
     morning_run()
+
     while True:
         time.sleep(3600)
