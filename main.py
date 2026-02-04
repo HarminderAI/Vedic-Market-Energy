@@ -103,22 +103,40 @@ def batch_download(tickers):
 # SCORING ENGINE
 # ==========================================================
 def trend_health(df):
-    if len(df) < 25:
-        return "UNKNOWN", 0
-    ema = ta.ema(df["Close"], 20).iloc[-1]
-    price = df["Close"].iloc[-1]
-    stretch = (price - ema) / ema * 100
+    try:
+        close = df["Close"].dropna()
+        if len(close) < 25:
+            return "UNKNOWN", 0.0
 
-    if stretch > 4:
-        return "OVERSTRETCHED", round(stretch, 2)
-    if stretch < -2:
-        return "DEEP_PULLBACK", round(stretch, 2)
-    return "HEALTHY", round(stretch, 2)
+        ema_series = ta.ema(close, length=20)
+
+        # 🚨 pandas-ta safety guard
+        if ema_series is None or ema_series.dropna().empty:
+            return "UNKNOWN", 0.0
+
+        ema = ema_series.dropna().iloc[-1]
+        price = close.iloc[-1]
+
+        stretch = (price - ema) / ema * 100
+
+        if stretch > 4:
+            return "OVERSTRETCHED", round(stretch, 2)
+        if stretch < -2:
+            return "DEEP_PULLBACK", round(stretch, 2)
+        return "HEALTHY", round(stretch, 2)
+
+    except Exception as e:
+        print("Trend health error:", e)
+        return "UNKNOWN", 0.0
 
 def score_stock(df):
-    rsi_series = ta.rsi(df["Close"], 14)
-    rsi = 50 if rsi_series is None or pd.isna(rsi_series.iloc[-1]) else rsi_series.iloc[-1]
+    rsi_series = ta.rsi(df["Close"], length=14)
 
+    if rsi_series is None or rsi_series.dropna().empty:
+    rsi = 50
+    else:
+    rsi = rsi_series.dropna().iloc[-1]
+    
     health, _ = trend_health(df)
     score = 0
 
