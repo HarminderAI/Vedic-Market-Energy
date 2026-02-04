@@ -1,167 +1,151 @@
 # ==========================================================
-# 📰 NEWS LOGIC — VADER SENTIMENT (2026 INSTITUTIONAL)
+# 📰 NEWS LOGIC — INSTITUTIONAL MACRO & SECTOR SENTIMENT (2026)
 # ==========================================================
 
 import os
 import requests
-from datetime import datetime, timedelta
-
-# ----------------------------------------------------------
-# NLTK BOOTSTRAP (Render-safe)
-# ----------------------------------------------------------
-
 import nltk
-try:
-    nltk.data.find("sentiment/vader_lexicon")
-except LookupError:
-    nltk.download("vader_lexicon", quiet=True)
-
+from datetime import datetime, timedelta
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ----------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # GNews API key
+NEWS_ENDPOINT = "https://gnews.io/api/v4/search"
 
-GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
-
-DEFAULT_SENTIMENT = 0.0
-DEFAULT_SUBJECTIVITY = 0.0
-
-MAX_ARTICLES = 3
+LANG = "en"
+COUNTRY = "in"
+MAX_ARTICLES = 10
 TIMEOUT = 10
-HOURS_BACK = 12  # UTC-safe rolling window
 
-# ⚠️ Institutional thresholds
-CRASH_SENTIMENT_THRESHOLD = -0.50  # dominates aggregation
-
-KEYWORDS = [
-    "nifty", "sensex", "market", "stocks", "equity",
-    "rbi", "inflation", "gdp", "rates", "economy",
-    "bank", "it", "metal", "pharma", "auto"
-]
-
-# ----------------------------------------------------------
-# INITIALIZE ANALYZER
-# ----------------------------------------------------------
-
-vader = SentimentIntensityAnalyzer()
+# Sector keyword mapping (used for sector-specific weighting)
+SECTOR_KEYWORDS = {
+    "BANK": ["bank", "rbi", "interest rate", "loan", "credit"],
+    "IT": ["it services", "software", "tech", "ai", "outsourcing"],
+    "METAL": ["steel", "metal", "commodity", "iron", "aluminium"],
+    "ENERGY": ["oil", "gas", "energy", "power"],
+    "PHARMA": ["pharma", "drug", "healthcare"],
+    "INFRA": ["infrastructure", "construction", "capital goods"],
+}
 
 # ----------------------------------------------------------
-# CORE FUNCTION
+# NLTK BOOTSTRAP (RENDER SAFE)
 # ----------------------------------------------------------
+def ensure_nltk():
+    try:
+        nltk.data.find("sentiment/vader_lexicon")
+    except LookupError:
+        nltk.download("vader_lexicon")
 
-def fetch_market_news(
-    query="Nifty OR Indian Stock Market",
-    country="in",
-    lang="en",
-    max_articles=MAX_ARTICLES,
-    hours_back=HOURS_BACK
-):
+ensure_nltk()
+SIA = SentimentIntensityAnalyzer()
+
+# ----------------------------------------------------------
+# CORE FETCH FUNCTION
+# ----------------------------------------------------------
+def fetch_market_news(hours_back=12):
     """
-    Returns:
-        sentiment (float)     -> VADER compound (institutional aggregation)
-        subjectivity (float)  -> Emotional intensity proxy
-        headlines (list[str])
+    Fetches Indian market news and computes:
+    - overall sentiment
+    - subjectivity (noise)
+    - sector-wise sentiment map
     """
 
-    if not GNEWS_API_KEY:
-        return DEFAULT_SENTIMENT, DEFAULT_SUBJECTIVITY, []
+    if not NEWS_API_KEY:
+        return {
+            "overall": 0.0,
+            "noise": 0.0,
+            "sector_map": {},
+            "headlines": []
+        }
+
+    from_time = (datetime.utcnow() - timedelta(hours=hours_back)).isoformat() + "Z"
+
+    params = {
+        "q": "Indian stock market OR Nifty OR Sensex",
+        "lang": LANG,
+        "country": COUNTRY,
+        "from": from_time,
+        "max": MAX_ARTICLES,
+        "apikey": NEWS_API_KEY,
+    }
 
     try:
-        # ✅ UTC-based rolling window (timezone safe)
-        published_after = (
-            datetime.utcnow() - timedelta(hours=hours_back)
-        ).isoformat("T") + "Z"
-
-        url = (
-            "https://gnews.io/api/v4/search"
-            f"?q={query}"
-            f"&lang={lang}"
-            f"&country={country}"
-            f"&max={max_articles}"
-            f"&from={published_after}"
-            f"&apikey={GNEWS_API_KEY}"
-        )
-
-        response = requests.get(url, timeout=TIMEOUT)
-        articles = response.json().get("articles", [])
-
-        compounds = []
-        subjectivities = []
-        headlines = []
-
-        for art in articles:
-            title = art.get("title", "").strip()
-            if not title:
-                continue
-
-            # Noise filter
-            if not any(k in title.lower() for k in KEYWORDS):
-                continue
-
-            scores = vader.polarity_scores(title)
-
-            compound = scores["compound"]
-
-            # Subjectivity proxy = emotional imbalance
-            subjectivity = abs(scores["pos"] - scores["neg"])
-
-            compounds.append(compound)
-            subjectivities.append(subjectivity)
-            headlines.append(title)
-
-        if not compounds:
-            return DEFAULT_SENTIMENT, DEFAULT_SUBJECTIVITY, []
-
-        # --------------------------------------------------
-        # 🏛️ INSTITUTIONAL AGGREGATION LOGIC
-        # --------------------------------------------------
-
-        worst_news = min(compounds)
-
-        if worst_news <= CRASH_SENTIMENT_THRESHOLD:
-            # Worst-case dominates (panic logic)
-            final_sentiment = worst_news
-        else:
-            # Otherwise average is acceptable
-            final_sentiment = sum(compounds) / len(compounds)
-
-        avg_subjectivity = sum(subjectivities) / len(subjectivities)
-
-        return (
-            round(final_sentiment, 2),
-            round(avg_subjectivity, 2),
-            headlines
-        )
-
+        resp = requests.get(NEWS_ENDPOINT, params=params, timeout=TIMEOUT)
+        articles = resp.json().get("articles", [])
     except Exception:
-        return DEFAULT_SENTIMENT, DEFAULT_SUBJECTIVITY, []
+        return {
+            "overall": 0.0,
+            "noise": 0.0,
+            "sector_map": {},
+            "headlines": []
+        }
+
+    compound_scores = []
+    noise_scores = []
+    sector_scores = {k: [] for k in SECTOR_KEYWORDS}
+    headlines = []
+
+    for art in articles:
+        title = art.get("title", "")
+        if not title:
+            continue
+
+        sentiment = SIA.polarity_scores(title)
+        compound = sentiment["compound"]
+
+        compound_scores.append(compound)
+        noise_scores.append(abs(compound))
+        headlines.append(title[:90])
+
+        lower = title.lower()
+        for sector, keys in SECTOR_KEYWORDS.items():
+            if any(k in lower for k in keys):
+                sector_scores[sector].append(compound)
+
+    overall = round(sum(compound_scores) / len(compound_scores), 3) if compound_scores else 0.0
+    noise = round(sum(noise_scores) / len(noise_scores), 3) if noise_scores else 0.0
+
+    sector_map = {
+        sector: round(sum(vals) / len(vals), 3)
+        for sector, vals in sector_scores.items()
+        if vals
+    }
+
+    return {
+        "overall": overall,
+        "noise": noise,
+        "sector_map": sector_map,
+        "headlines": headlines[:5],
+    }
 
 # ----------------------------------------------------------
 # TELEGRAM FORMATTER
 # ----------------------------------------------------------
+def format_news_block(news):
+    overall = news["overall"]
+    noise = news["noise"]
+    headlines = news["headlines"]
 
-def format_news_block(sentiment, subjectivity, headlines):
-    if not headlines:
-        return "📰 News: Neutral (No relevant macro headlines)"
+    if overall > 0.2:
+        mood = "🟢 POSITIVE"
+    elif overall < -0.2:
+        mood = "🔴 NEGATIVE"
+    else:
+        mood = "🟡 NEUTRAL"
 
-    mood = (
-        "🟢 Positive" if sentiment > 0.20 else
-        "🔴 Negative" if sentiment < -0.20 else
-        "🟡 Neutral"
-    )
-
-    tone = (
-        "🔥 Opinion-Heavy" if subjectivity > 0.6 else
-        "📘 Factual"
-    )
+    noise_flag = "⚠️ HIGH NOISE" if noise > 0.6 else "✅ LOW NOISE"
 
     lines = [
-        f"📰 News Sentiment (VADER): {sentiment:+.2f} ({mood})",
-        f"🧠 News Tone: {tone} (Emotion: {subjectivity:.2f})"
+        "📰 *Market Sentiment*",
+        f"Bias: {mood}",
+        f"Noise: {noise_flag} ({noise})",
     ]
 
-    for h in headlines:
-        lines.append(f"• {h[:90]}")
+    if headlines:
+        lines.append("")
+        for h in headlines:
+            lines.append(f"• {h}")
 
     return "\n".join(lines)
