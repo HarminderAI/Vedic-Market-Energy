@@ -1,18 +1,26 @@
+# Core
 python-dateutil
 pytz
+requests
+
+# Data & Markets
+yfinance==1.1.0
+pandas>=3.0.0
+numpy>=2.0.0
+pandas-ta
+
+# Google Sheets (Persistence Layer)
+gspread
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+
+# News & Sentiment (VADER)
+nltk
+
+# Web Server (Render keep-alive)
 flask
 gunicorn
-yfinance>=0.2.51
-pandas>=2.0.0
-pandas-ta>=0.3.14b0
-requests>=2.31.0
-textblob>=0.17.1
-gspread>=5.12.0
-google-auth>=2.25.0
-google-auth-oauthlib>=1.2.0
-google-auth-httplib2>=0.2.0
-nltk
-numpy
-beautifulsoup4
-curl_cffi
-multitasking
+
+# Utilities
+tqdm
