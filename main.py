@@ -33,7 +33,6 @@ CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SERVICE_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 
-TOTAL_CAPITAL = 1.0
 GLOBAL_EXPOSURE_CAP = 0.90
 SECTOR_CAP = 0.50
 EXIT_SCORE_DROP = 15
@@ -53,7 +52,7 @@ def send_msg(text):
         print("Telegram error:", e)
 
 # ==========================================================
-# GOOGLE SHEETS
+# GOOGLE SHEETS — HARDENED
 # ==========================================================
 def sheet_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -63,17 +62,27 @@ def sheet_client():
 gc = sheet_client()
 sheet = gc.open_by_key(GOOGLE_SHEET_ID)
 
-def get_ws(name, headers):
+def safe_sheet_access(ws_name, headers=None):
+    """
+    Reconnects automatically if Google Sheet session expires.
+    """
+    global gc, sheet
     try:
-        return sheet.worksheet(name)
+        return sheet.worksheet(ws_name)
     except:
-        ws = sheet.add_worksheet(name, rows=200, cols=20)
-        ws.append_row(headers)
-        return ws
+        gc = sheet_client()
+        sheet = gc.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            return sheet.worksheet(ws_name)
+        except:
+            ws = sheet.add_worksheet(ws_name, rows=200, cols=20)
+            if headers:
+                ws.append_row(headers)
+            return ws
 
-state_ws   = get_ws("state",   ["key", "value"])
-stocks_ws  = get_ws("stocks",  ["symbol", "score", "bucket", "size", "health", "sector"])
-history_ws = get_ws("history", ["date", "symbol", "event", "detail"])
+state_ws   = safe_sheet_access("state", ["key", "value"])
+stocks_ws  = safe_sheet_access("stocks", ["symbol","score","bucket","size","health","sector"])
+history_ws = safe_sheet_access("history", ["date","symbol","event","detail"])
 
 # ==========================================================
 # MARKET DATA
@@ -87,7 +96,7 @@ def safe_download(ticker, days=80):
             df.columns = df.columns.get_level_values(0)
         if "Close" not in df:
             return None
-        return df
+        return df.dropna()
     except:
         return None
 
@@ -106,7 +115,7 @@ def batch_download(tickers):
     return out
 
 # ==========================================================
-# SCORING ENGINE
+# INDICATORS — SAFE LAST-VALID VALUE
 # ==========================================================
 def trend_health(df):
     try:
@@ -115,10 +124,10 @@ def trend_health(df):
             return "UNKNOWN", 0.0
 
         ema_series = ta.ema(close, length=20)
-        if ema_series is None or ema_series.dropna().empty:
+        ema = ema_series.dropna().iloc[-1] if ema_series is not None and not ema_series.dropna().empty else None
+        if ema is None:
             return "UNKNOWN", 0.0
 
-        ema = ema_series.dropna().iloc[-1]
         price = close.iloc[-1]
         stretch = (price - ema) / ema * 100
 
@@ -133,11 +142,7 @@ def trend_health(df):
 
 def score_stock(df):
     rsi_series = ta.rsi(df["Close"], length=14)
-
-    if rsi_series is None or rsi_series.dropna().empty:
-        rsi = 50
-    else:
-        rsi = rsi_series.dropna().iloc[-1]
+    rsi = rsi_series.dropna().iloc[-1] if rsi_series is not None and not rsi_series.dropna().empty else 50
 
     health, _ = trend_health(df)
     score = 0
@@ -157,7 +162,7 @@ def assign_bucket(score):
     return "AVOID"
 
 def position_size(bucket):
-    return {"STRONG_BUY": 0.25, "BUY": 0.15, "WATCHLIST": 0.05}.get(bucket, 0)
+    return {"STRONG_BUY":0.25,"BUY":0.15,"WATCHLIST":0.05}.get(bucket,0)
 
 # ==========================================================
 # MORNING ENGINE
@@ -166,32 +171,27 @@ def morning_run():
     send_msg("🌅 Morning Scan Started")
 
     STOCKS = {
-        "HDFCBANK.NS": "BANK", "ICICIBANK.NS": "BANK", "SBIN.NS": "BANK",
-        "INFY.NS": "IT", "TCS.NS": "IT",
-        "RELIANCE.NS": "ENERGY", "LT.NS": "INFRA",
-        "TATASTEEL.NS": "METAL", "JSWSTEEL.NS": "METAL",
-        "SUNPHARMA.NS": "PHARMA"
+        "HDFCBANK.NS":"BANK","ICICIBANK.NS":"BANK","SBIN.NS":"BANK",
+        "INFY.NS":"IT","TCS.NS":"IT",
+        "RELIANCE.NS":"ENERGY","LT.NS":"INFRA",
+        "TATASTEEL.NS":"METAL","JSWSTEEL.NS":"METAL",
+        "SUNPHARMA.NS":"PHARMA"
     }
 
     prev_health = {}
-    rows = state_ws.get_all_records()
+    rows = safe_sheet_access("state").get_all_records()
     if rows:
         try:
             prev_health = json.loads(rows[0]["value"]).get("health", {})
         except:
-            prev_health = {}
+            pass
 
     data = batch_download(STOCKS.keys())
     ranked = []
 
     for sym, df in data.items():
         score, health = score_stock(df)
-
-        allow = (
-            health == "HEALTHY" or
-            (prev_health.get(sym) == "OVERSTRETCHED" and health == "HEALTHY")
-        )
-
+        allow = health == "HEALTHY" or (prev_health.get(sym) == "OVERSTRETCHED" and health == "HEALTHY")
         if allow:
             ranked.append({
                 "symbol": sym,
@@ -205,22 +205,18 @@ def morning_run():
 
     total_alloc = 0.0
     sector_alloc = defaultdict(float)
-    alerted_sectors = set()
     final = []
 
     for s in ranked:
         if len(final) == 5:
             break
-
         size = position_size(s["bucket"])
         if size == 0:
             continue
         if total_alloc + size > GLOBAL_EXPOSURE_CAP:
             continue
         if sector_alloc[s["sector"]] + size > SECTOR_CAP:
-            if s["sector"] not in alerted_sectors:
-                send_msg(f"⚠️ Sector Concentration Alert: {s['sector']}")
-                alerted_sectors.add(s["sector"])
+            send_msg(f"⚠️ Sector Concentration Alert: {s['sector']}")
             continue
 
         total_alloc += size
@@ -228,20 +224,21 @@ def morning_run():
         s["size"] = round(size * 100, 1)
         final.append(s)
 
-    # Persist state
-    health_map = {s["symbol"]: s["health"] for s in ranked}
-    state_ws.clear()
-    state_ws.append_row(["state", json.dumps({"date": ist_today(), "health": health_map})])
+    # Persist
+    safe_sheet_access("state").clear()
+    safe_sheet_access("state").append_row(
+        ["state", json.dumps({"date": ist_today(), "health": {s["symbol"]: s["health"] for s in ranked}})]
+    )
 
-    stocks_ws.clear()
-    stocks_ws.append_row(["symbol", "score", "bucket", "size", "health", "sector"])
+    ws = safe_sheet_access("stocks", ["symbol","score","bucket","size","health","sector"])
+    ws.clear()
+    ws.append_row(["symbol","score","bucket","size","health","sector"])
     for s in final:
-        stocks_ws.append_row([s[k] for k in ["symbol","score","bucket","size","health","sector"]])
+        ws.append_row([s[k] for k in ["symbol","score","bucket","size","health","sector"]])
 
     msg = [f"🏛️ Top Picks — {ist_today()}", ""]
     for s in final:
         msg.append(f"• {s['symbol']} | {s['bucket']} | {s['score']} | {s['size']}% | {s['health']}")
-
     send_msg("\n".join(msg))
 
 # ==========================================================
@@ -250,17 +247,18 @@ def morning_run():
 def eod_run():
     send_msg("📊 EOD Analytics Ready")
 
-    prev = {r["symbol"]: int(r["score"]) for r in stocks_ws.get_all_records()}
+    prev = {r["symbol"]: int(r["score"]) for r in safe_sheet_access("stocks").get_all_records()}
     if not prev:
         return
 
     data = batch_download(prev.keys())
-
     for sym, df in data.items():
         score, _ = score_stock(df)
         if prev[sym] - score >= EXIT_SCORE_DROP:
             send_msg(f"❌ EXIT SIGNAL: {sym} | Score Drop {prev[sym] - score}")
-            history_ws.append_row([ist_today(), sym, "EXIT", f"{prev[sym]} → {score}"])
+            safe_sheet_access("history").append_row(
+                [ist_today(), sym, "EXIT", f"{prev[sym]} → {score}"]
+            )
 
 # ==========================================================
 # BOOTSTRAP
