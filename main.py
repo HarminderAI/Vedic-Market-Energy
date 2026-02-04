@@ -1,7 +1,7 @@
 # ==========================================================
 # 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL (2026 HARDENED)
 # ==========================================================
-import os, json, time, datetime
+ import os, json, time, datetime
 import requests, pytz
 import yfinance as yf
 import pandas as pd
@@ -12,7 +12,6 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from keep_alive import keep_alive
-from news_logic import fetch_market_news, format_news_block
 
 # ==========================================================
 # TIMEZONE
@@ -52,7 +51,7 @@ def send_msg(text):
         print("Telegram error:", e)
 
 # ==========================================================
-# GOOGLE SHEETS — HARDENED
+# GOOGLE SHEETS — SAFE RECONNECT
 # ==========================================================
 def sheet_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -62,25 +61,22 @@ def sheet_client():
 gc = sheet_client()
 sheet = gc.open_by_key(GOOGLE_SHEET_ID)
 
-def safe_sheet_access(ws_name, headers=None):
-    """
-    Reconnects automatically if Google Sheet session expires.
-    """
+def safe_sheet_access(name, headers=None):
     global gc, sheet
     try:
-        return sheet.worksheet(ws_name)
+        return sheet.worksheet(name)
     except:
         gc = sheet_client()
         sheet = gc.open_by_key(GOOGLE_SHEET_ID)
         try:
-            return sheet.worksheet(ws_name)
+            return sheet.worksheet(name)
         except:
-            ws = sheet.add_worksheet(ws_name, rows=200, cols=20)
+            ws = sheet.add_worksheet(name, rows=200, cols=20)
             if headers:
                 ws.append_row(headers)
             return ws
 
-state_ws   = safe_sheet_access("state", ["key", "value"])
+state_ws   = safe_sheet_access("state", ["key","value"])
 stocks_ws  = safe_sheet_access("stocks", ["symbol","score","bucket","size","health","sector"])
 history_ws = safe_sheet_access("history", ["date","symbol","event","detail"])
 
@@ -115,7 +111,7 @@ def batch_download(tickers):
     return out
 
 # ==========================================================
-# INDICATORS — SAFE LAST-VALID VALUE
+# INDICATORS — SAFE LAST VALID VALUE
 # ==========================================================
 def trend_health(df):
     try:
@@ -132,11 +128,10 @@ def trend_health(df):
         stretch = (price - ema) / ema * 100
 
         if stretch > 4:
-            return "OVERSTRETCHED", round(stretch, 2)
+            return "OVERSTRETCHED", round(stretch,2)
         if stretch < -2:
-            return "DEEP_PULLBACK", round(stretch, 2)
-        return "HEALTHY", round(stretch, 2)
-
+            return "DEEP_PULLBACK", round(stretch,2)
+        return "HEALTHY", round(stretch,2)
     except:
         return "UNKNOWN", 0.0
 
@@ -165,7 +160,7 @@ def position_size(bucket):
     return {"STRONG_BUY":0.25,"BUY":0.15,"WATCHLIST":0.05}.get(bucket,0)
 
 # ==========================================================
-# MORNING ENGINE
+# MORNING ENGINE (WITH FALLBACK)
 # ==========================================================
 def morning_run():
     send_msg("🌅 Morning Scan Started")
@@ -182,7 +177,7 @@ def morning_run():
     rows = safe_sheet_access("state").get_all_records()
     if rows:
         try:
-            prev_health = json.loads(rows[0]["value"]).get("health", {})
+            prev_health = json.loads(rows[0]["value"]).get("health",{})
         except:
             pass
 
@@ -191,7 +186,7 @@ def morning_run():
 
     for sym, df in data.items():
         score, health = score_stock(df)
-        allow = health == "HEALTHY" or (prev_health.get(sym) == "OVERSTRETCHED" and health == "HEALTHY")
+        allow = health == "HEALTHY" or (prev_health.get(sym)=="OVERSTRETCHED" and health=="HEALTHY")
         if allow:
             ranked.append({
                 "symbol": sym,
@@ -201,34 +196,43 @@ def morning_run():
                 "sector": STOCKS[sym]
             })
 
-    ranked.sort(key=lambda x: x["score"], reverse=True)
+    ranked.sort(key=lambda x:x["score"], reverse=True)
 
     total_alloc = 0.0
     sector_alloc = defaultdict(float)
     final = []
 
+    # -------- STRICT PASS --------
     for s in ranked:
-        if len(final) == 5:
-            break
+        if len(final)==5: break
         size = position_size(s["bucket"])
-        if size == 0:
-            continue
-        if total_alloc + size > GLOBAL_EXPOSURE_CAP:
-            continue
+        if size==0: continue
+        if total_alloc + size > GLOBAL_EXPOSURE_CAP: continue
         if sector_alloc[s["sector"]] + size > SECTOR_CAP:
-            send_msg(f"⚠️ Sector Concentration Alert: {s['sector']}")
             continue
-
         total_alloc += size
         sector_alloc[s["sector"]] += size
-        s["size"] = round(size * 100, 1)
+        s["size"] = round(size*100,1)
         final.append(s)
 
-    # Persist
+    # -------- FALLBACK PASS --------
+    if not final:
+        send_msg("⚠️ Risk-Off Day: No stocks passed strict filters. Reduced exposure mode.")
+        for s in ranked:
+            if len(final)==3: break
+            size = position_size(s["bucket"])
+            if size==0: continue
+            if total_alloc + size > GLOBAL_EXPOSURE_CAP: continue
+            total_alloc += size
+            s["size"] = round(size*100,1)
+            final.append(s)
+
+    # -------- PERSIST STATE --------
     safe_sheet_access("state").clear()
-    safe_sheet_access("state").append_row(
-        ["state", json.dumps({"date": ist_today(), "health": {s["symbol"]: s["health"] for s in ranked}})]
-    )
+    safe_sheet_access("state").append_row([
+        "state",
+        json.dumps({"date":ist_today(),"health":{s["symbol"]:s["health"] for s in ranked}})
+    ])
 
     ws = safe_sheet_access("stocks", ["symbol","score","bucket","size","health","sector"])
     ws.clear()
@@ -237,8 +241,12 @@ def morning_run():
         ws.append_row([s[k] for k in ["symbol","score","bucket","size","health","sector"]])
 
     msg = [f"🏛️ Top Picks — {ist_today()}", ""]
-    for s in final:
-        msg.append(f"• {s['symbol']} | {s['bucket']} | {s['score']} | {s['size']}% | {s['health']}")
+    if not final:
+        msg.append("💤 No deployable opportunities today. Capital preserved.")
+    else:
+        for s in final:
+            msg.append(f"• {s['symbol']} | {s['bucket']} | {s['score']} | {s['size']}% | {s['health']}")
+
     send_msg("\n".join(msg))
 
 # ==========================================================
@@ -253,19 +261,20 @@ def eod_run():
 
     data = batch_download(prev.keys())
     for sym, df in data.items():
-        score, _ = score_stock(df)
+        score,_ = score_stock(df)
         if prev[sym] - score >= EXIT_SCORE_DROP:
-            send_msg(f"❌ EXIT SIGNAL: {sym} | Score Drop {prev[sym] - score}")
+            send_msg(f"❌ EXIT SIGNAL: {sym} | Score Drop {prev[sym]-score}")
             safe_sheet_access("history").append_row(
                 [ist_today(), sym, "EXIT", f"{prev[sym]} → {score}"]
             )
 
 # ==========================================================
-# BOOTSTRAP
+# BOOTSTRAP (NON-BLOCKING SAFE)
 # ==========================================================
 if __name__ == "__main__":
     keep_alive(eod_callback=eod_run)
     morning_run()
-
     while True:
         time.sleep(3600)
+    
+    
