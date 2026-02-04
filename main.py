@@ -1,5 +1,5 @@
 # ==========================================================
-# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL (2026 POLISHED)
+# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL (2026 STABLE)
 # ==========================================================
 
 import os, json, time, datetime
@@ -13,14 +13,18 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from keep_alive import keep_alive
+from news_logic import fetch_market_news, format_news_block
 
 # ==========================================================
 # TIMEZONE
 # ==========================================================
 IST = pytz.timezone("Asia/Kolkata")
 
+def ist_now():
+    return datetime.datetime.now(IST)
+
 def ist_today():
-    return str(datetime.datetime.now(IST).date())
+    return str(ist_now().date())
 
 # ==========================================================
 # CONFIG
@@ -36,7 +40,7 @@ EXIT_SCORE_DROP = 15
 MAX_WORKERS = 5
 
 # ==========================================================
-# TELEGRAM (MARKDOWN ENABLED)
+# TELEGRAM
 # ==========================================================
 def send_msg(text):
     try:
@@ -53,7 +57,7 @@ def send_msg(text):
         print("Telegram error:", e)
 
 # ==========================================================
-# GOOGLE SHEETS (SAFE)
+# GOOGLE SHEETS — SAFE REFRESH
 # ==========================================================
 def sheet_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -73,27 +77,16 @@ def safe_sheet(ws_name, headers):
         try:
             return sheet.worksheet(ws_name)
         except:
-            ws = sheet.add_worksheet(ws_name, rows=200, cols=len(headers))
+            ws = sheet.add_worksheet(ws_name, rows=300, cols=len(headers))
             ws.append_row(headers)
             return ws
 
-state_ws   = safe_sheet("state",   ["key","value"])
+state_ws   = safe_sheet("state",   ["key", "value"])
 stocks_ws  = safe_sheet("stocks",  ["symbol","score","bucket","size","health","sector"])
 history_ws = safe_sheet("history", ["date","symbol","event","detail"])
 
 # ==========================================================
-# UNIVERSE
-# ==========================================================
-STOCKS = {
-    "HDFCBANK.NS":"BANK","ICICIBANK.NS":"BANK","SBIN.NS":"BANK",
-    "INFY.NS":"IT","TCS.NS":"IT",
-    "RELIANCE.NS":"ENERGY","LT.NS":"INFRA",
-    "TATASTEEL.NS":"METAL","JSWSTEEL.NS":"METAL",
-    "SUNPHARMA.NS":"PHARMA"
-}
-
-# ==========================================================
-# MARKET DATA
+# MARKET DATA — HARDENED
 # ==========================================================
 def safe_download(ticker, days=80):
     try:
@@ -103,13 +96,18 @@ def safe_download(ticker, days=80):
             auto_adjust=True,
             progress=False
         )
+
         if df is None or df.empty:
             return None
+
         if df.columns.nlevels > 1:
             df.columns = df.columns.get_level_values(0)
+
         if "Close" not in df:
             return None
+
         return df.dropna()
+
     except Exception as e:
         print(f"Download error {ticker}:", e)
         return None
@@ -129,17 +127,20 @@ def batch_download(tickers):
     return out
 
 # ==========================================================
-# INDICATORS
+# INDICATORS — SAFE LAST VALUE
 # ==========================================================
 def trend_health(df):
-    close = df["Close"]
-    ema = ta.ema(close, length=20)
-    if ema is None or ema.dropna().empty:
+    close = df["Close"].dropna()
+    if len(close) < 25:
         return "UNKNOWN", 0.0
 
+    ema_series = ta.ema(close, length=20)
+    if ema_series is None or ema_series.dropna().empty:
+        return "UNKNOWN", 0.0
+
+    ema = ema_series.dropna().iloc[-1]
     price = close.iloc[-1]
-    ema_v = ema.dropna().iloc[-1]
-    stretch = (price - ema_v) / ema_v * 100
+    stretch = (price - ema) / ema * 100
 
     if stretch > 4:
         return "OVERSTRETCHED", round(stretch, 2)
@@ -148,12 +149,12 @@ def trend_health(df):
     return "HEALTHY", round(stretch, 2)
 
 def score_stock(df):
-    rsi = ta.rsi(df["Close"], length=14)
-    rsi_v = rsi.dropna().iloc[-1] if rsi is not None and not rsi.dropna().empty else 50
+    rsi_series = ta.rsi(df["Close"], length=14)
+    rsi = rsi_series.dropna().iloc[-1] if rsi_series is not None and not rsi_series.dropna().empty else 50
 
     health, _ = trend_health(df)
-    score = 30 if rsi_v > 60 else 15 if rsi_v > 50 else 5
 
+    score = 30 if rsi > 60 else 15 if rsi > 50 else 5
     if health == "OVERSTRETCHED":
         score -= 20
     elif health == "HEALTHY":
@@ -171,26 +172,38 @@ def position_size(bucket):
     return {"STRONG_BUY":0.25,"BUY":0.15,"WATCHLIST":0.05}.get(bucket,0)
 
 # ==========================================================
-# MORNING ENGINE (IDEMPOTENT STATE + RETRY)
+# MORNING ENGINE
 # ==========================================================
 def morning_run():
-    send_msg("*🌅 Morning Scan Started*")
+    send_msg("🌅 *Morning Scan Started*")
 
+    # ---- NEWS MACRO CONTEXT ----
+    news_items = fetch_market_news()
+    send_msg(format_news_block(news_items))
+
+    STOCKS = {
+        "HDFCBANK.NS":"BANK","ICICIBANK.NS":"BANK","SBIN.NS":"BANK",
+        "INFY.NS":"IT","TCS.NS":"IT",
+        "RELIANCE.NS":"ENERGY","LT.NS":"INFRA",
+        "TATASTEEL.NS":"METAL","JSWSTEEL.NS":"METAL",
+        "SUNPHARMA.NS":"PHARMA"
+    }
+
+    # ---- READ LAST HEALTH STATE (IDEMPOTENT) ----
     prev_health = {}
-    rows = state_ws.get_all_records()
-    for r in rows:
+    for r in state_ws.get_all_records():
         if r.get("key") == "health_state":
-            prev_health = json.loads(r["value"]).get("health", {})
-            break
+            try:
+                prev_health = json.loads(r["value"]).get("health", {})
+            except:
+                pass
 
     data = batch_download(STOCKS.keys())
     ranked = []
 
     for sym, df in data.items():
         score, health = score_stock(df)
-        allow = health == "HEALTHY" or (
-            prev_health.get(sym) == "OVERSTRETCHED" and health == "HEALTHY"
-        )
+        allow = health == "HEALTHY" or (prev_health.get(sym) == "OVERSTRETCHED" and health == "HEALTHY")
         if allow:
             ranked.append({
                 "symbol": sym,
@@ -202,17 +215,21 @@ def morning_run():
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
 
-    total_alloc = 0
+    total_alloc = 0.0
     sector_alloc = defaultdict(float)
     final = []
 
     for s in ranked:
         if len(final) == 5:
             break
+
         size = position_size(s["bucket"])
-        if size == 0: continue
-        if total_alloc + size > GLOBAL_EXPOSURE_CAP: continue
+        if size == 0:
+            continue
+        if total_alloc + size > GLOBAL_EXPOSURE_CAP:
+            continue
         if sector_alloc[s["sector"]] + size > SECTOR_CAP:
+            send_msg(f"⚠️ Sector Concentration Alert: {s['sector']}")
             continue
 
         total_alloc += size
@@ -220,30 +237,12 @@ def morning_run():
         s["size"] = round(size * 100, 1)
         final.append(s)
 
-    payload = json.dumps({
-        "date": ist_today(),
-        "health": {s["symbol"]: s["health"] for s in ranked}
-    })
-
-    updated = False
-    for idx, r in enumerate(rows, start=2):
-        if r.get("key") == "health_state":
-            for _ in range(2):
-                try:
-                    state_ws.update_cell(idx, 2, payload)
-                    updated = True
-                    break
-                except:
-                    time.sleep(2)
-            break
-
-    if not updated:
-        for _ in range(2):
-            try:
-                state_ws.append_row(["health_state", payload])
-                break
-            except:
-                time.sleep(2)
+    # ---- SAVE STATE (NO BLOAT) ----
+    state_ws.clear()
+    state_ws.append_row([
+        "health_state",
+        json.dumps({"date": ist_today(), "health": {s["symbol"]: s["health"] for s in ranked}})
+    ])
 
     stocks_ws.clear()
     stocks_ws.append_row(["symbol","score","bucket","size","health","sector"])
@@ -251,14 +250,12 @@ def morning_run():
         stocks_ws.append_row([s[k] for k in ["symbol","score","bucket","size","health","sector"]])
 
     if not final:
-        send_msg("⚠️ *Risk-Off Day*\n💤 Capital preserved.")
+        send_msg("⚠️ *Risk-Off Day*\n💤 No deployable opportunities. Capital preserved.")
         return
 
-    msg = [f"*🏛️ Top Picks — {ist_today()}*", ""]
+    msg = [f"🏛️ *Top Picks — {ist_today()}*", ""]
     for s in final:
-        msg.append(
-            f"• *{s['symbol']}* | {s['bucket']} | {s['score']} | {s['size']}% | {s['health']}"
-        )
+        msg.append(f"• *{s['symbol']}* | {s['bucket']} | {s['score']} | {s['size']}% | {s['health']}")
 
     send_msg("\n".join(msg))
 
@@ -266,7 +263,7 @@ def morning_run():
 # EOD ENGINE
 # ==========================================================
 def eod_run():
-    send_msg("*📊 EOD Analytics Ready*")
+    send_msg("📊 *EOD Analytics Ready*")
 
     prev = {r["symbol"]: int(r["score"]) for r in stocks_ws.get_all_records()}
     if not prev:
@@ -275,22 +272,15 @@ def eod_run():
     data = batch_download(prev.keys())
     for sym, df in data.items():
         score, _ = score_stock(df)
-        drop = prev[sym] - score
-        if drop >= EXIT_SCORE_DROP:
-            send_msg(f"*❌ EXIT SIGNAL:* {sym} | Score Drop {drop}")
-            history_ws.append_row([
-                ist_today(),
-                sym,
-                "EXIT",
-                f"{prev[sym]} → {score}"
-            ])
+        if prev[sym] - score >= EXIT_SCORE_DROP:
+            send_msg(f"❌ *EXIT SIGNAL*: {sym} | Score Drop {prev[sym] - score}")
+            history_ws.append_row([ist_today(), sym, "EXIT", f"{prev[sym]} → {score}"])
 
 # ==========================================================
-# BOOTSTRAP
+# BOOTSTRAP — NON-BLOCKING (CORRECT FLOW)
 # ==========================================================
 if __name__ == "__main__":
     keep_alive(eod_callback=eod_run)
     morning_run()
-
     while True:
         time.sleep(3600)
