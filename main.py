@@ -1,7 +1,6 @@
 # ==========================================================
 # 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL (2026 HARDENED)
 # ==========================================================
-
 import os, json, time, datetime
 import requests, pytz
 import yfinance as yf
@@ -86,6 +85,8 @@ def safe_download(ticker, days=80):
             return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+        if "Close" not in df:
+            return None
         return df
     except:
         return None
@@ -93,10 +94,15 @@ def safe_download(ticker, days=80):
 def batch_download(tickers):
     out = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        fut = {ex.submit(safe_download, t): t for t in tickers}
-        for f in as_completed(fut):
-            if f.result() is not None:
-                out[fut[f]] = f.result()
+        futures = {ex.submit(safe_download, t): t for t in tickers}
+        for f in as_completed(futures):
+            sym = futures[f]
+            try:
+                df = f.result()
+                if df is not None:
+                    out[sym] = df
+            except:
+                pass
     return out
 
 # ==========================================================
@@ -109,14 +115,11 @@ def trend_health(df):
             return "UNKNOWN", 0.0
 
         ema_series = ta.ema(close, length=20)
-
-        # 🚨 pandas-ta safety guard
         if ema_series is None or ema_series.dropna().empty:
             return "UNKNOWN", 0.0
 
         ema = ema_series.dropna().iloc[-1]
         price = close.iloc[-1]
-
         stretch = (price - ema) / ema * 100
 
         if stretch > 4:
@@ -125,18 +128,17 @@ def trend_health(df):
             return "DEEP_PULLBACK", round(stretch, 2)
         return "HEALTHY", round(stretch, 2)
 
-    except Exception as e:
-        print("Trend health error:", e)
+    except:
         return "UNKNOWN", 0.0
 
 def score_stock(df):
     rsi_series = ta.rsi(df["Close"], length=14)
 
     if rsi_series is None or rsi_series.dropna().empty:
-    rsi = 50
+        rsi = 50
     else:
-    rsi = rsi_series.dropna().iloc[-1]
-    
+        rsi = rsi_series.dropna().iloc[-1]
+
     health, _ = trend_health(df)
     score = 0
 
@@ -158,7 +160,7 @@ def position_size(bucket):
     return {"STRONG_BUY": 0.25, "BUY": 0.15, "WATCHLIST": 0.05}.get(bucket, 0)
 
 # ==========================================================
-# MORNING ENGINE (FIXED TOP-5 LOGIC)
+# MORNING ENGINE
 # ==========================================================
 def morning_run():
     send_msg("🌅 Morning Scan Started")
@@ -171,13 +173,13 @@ def morning_run():
         "SUNPHARMA.NS": "PHARMA"
     }
 
-    prev_state = {}
+    prev_health = {}
     rows = state_ws.get_all_records()
     if rows:
         try:
-            prev_state = json.loads(rows[0]["value"]).get("health", {})
+            prev_health = json.loads(rows[0]["value"]).get("health", {})
         except:
-            prev_state = {}
+            prev_health = {}
 
     data = batch_download(STOCKS.keys())
     ranked = []
@@ -185,10 +187,9 @@ def morning_run():
     for sym, df in data.items():
         score, health = score_stock(df)
 
-        # Pullback re-entry condition
         allow = (
             health == "HEALTHY" or
-            (prev_state.get(sym) == "OVERSTRETCHED" and health == "HEALTHY")
+            (prev_health.get(sym) == "OVERSTRETCHED" and health == "HEALTHY")
         )
 
         if allow:
@@ -202,20 +203,24 @@ def morning_run():
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
 
-    total_alloc = 0
+    total_alloc = 0.0
     sector_alloc = defaultdict(float)
+    alerted_sectors = set()
     final = []
 
-    # 🔥 FIX: iterate full ranked list until 5 filled
     for s in ranked:
         if len(final) == 5:
             break
 
         size = position_size(s["bucket"])
+        if size == 0:
+            continue
         if total_alloc + size > GLOBAL_EXPOSURE_CAP:
             continue
         if sector_alloc[s["sector"]] + size > SECTOR_CAP:
-            send_msg(f"⚠️ Sector Concentration Alert: {s['sector']}")
+            if s["sector"] not in alerted_sectors:
+                send_msg(f"⚠️ Sector Concentration Alert: {s['sector']}")
+                alerted_sectors.add(s["sector"])
             continue
 
         total_alloc += size
@@ -235,27 +240,27 @@ def morning_run():
 
     msg = [f"🏛️ Top Picks — {ist_today()}", ""]
     for s in final:
-        msg.append(
-            f"• {s['symbol']} | {s['bucket']} | {s['score']} | {s['size']}% | {s['health']}"
-        )
+        msg.append(f"• {s['symbol']} | {s['bucket']} | {s['score']} | {s['size']}% | {s['health']}")
 
     send_msg("\n".join(msg))
 
 # ==========================================================
-# EOD ENGINE (EXIT + HEALTH PERSISTENCE)
+# EOD ENGINE
 # ==========================================================
 def eod_run():
     send_msg("📊 EOD Analytics Ready")
 
     prev = {r["symbol"]: int(r["score"]) for r in stocks_ws.get_all_records()}
+    if not prev:
+        return
+
     data = batch_download(prev.keys())
 
     for sym, df in data.items():
-        score, health = score_stock(df)
-
+        score, _ = score_stock(df)
         if prev[sym] - score >= EXIT_SCORE_DROP:
             send_msg(f"❌ EXIT SIGNAL: {sym} | Score Drop {prev[sym] - score}")
-            history_ws.append_row([ist_today(), sym, "EXIT", f"Score {prev[sym]} → {score}"])
+            history_ws.append_row([ist_today(), sym, "EXIT", f"{prev[sym]} → {score}"])
 
 # ==========================================================
 # BOOTSTRAP
