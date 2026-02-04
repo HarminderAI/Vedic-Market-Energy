@@ -1,54 +1,48 @@
 # ==========================================================
-# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL (2026)
+# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL (2026 HARDENED)
 # ==========================================================
 
 import os, json, time, datetime
-import requests
-import pytz
+import requests, pytz
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import gspread
 from google.oauth2.service_account import Credentials
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from keep_alive import keep_alive
 from news_logic import fetch_market_news, format_news_block
 
 # ==========================================================
-# TIMEZONE (IST LOCK)
+# TIMEZONE
 # ==========================================================
-
 IST = pytz.timezone("Asia/Kolkata")
 
 def ist_now():
     return datetime.datetime.now(IST)
 
 def ist_today():
-    return ist_now().date()
+    return str(ist_now().date())
 
 # ==========================================================
 # CONFIG
 # ==========================================================
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SERVICE_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 
-SUCCESS_THRESHOLD = 0.20
-EXIT_SCORE_DROP = 15
-
 TOTAL_CAPITAL = 1.0
 GLOBAL_EXPOSURE_CAP = 0.90
-
-MAX_WORKERS = 5  # Yahoo-safe in 2026
+SECTOR_CAP = 0.50
+EXIT_SCORE_DROP = 15
+MAX_WORKERS = 5
 
 # ==========================================================
 # TELEGRAM
 # ==========================================================
-
 def send_msg(text):
     try:
         requests.post(
@@ -56,50 +50,35 @@ def send_msg(text):
             data={"chat_id": CHAT_ID, "text": text},
             timeout=10
         )
-    except:
-        pass
+    except Exception as e:
+        print("Telegram error:", e)
 
 # ==========================================================
-# GOOGLE SHEETS (SAFE BOOTSTRAP)
+# GOOGLE SHEETS
 # ==========================================================
-
 def sheet_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(SERVICE_JSON, scopes=scopes)
     return gspread.authorize(creds)
 
-def get_or_create_worksheet(spreadsheet, title, rows=100, cols=20):
-    try:
-        return spreadsheet.worksheet(title)
-    except gspread.exceptions.WorksheetNotFound:
-        print(f"⚠️ Creating worksheet: {title}")
-        ws = spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
-
-        HEADERS = {
-            "state":   ["key", "value"],
-            "history": ["date", "symbol", "score", "bucket", "result"],
-            "stocks":  ["symbol", "score", "bucket", "size", "trend_health"],
-            "sectors": ["date", "sector", "allocation", "accuracy"]
-        }
-
-        if title in HEADERS:
-            ws.append_row(HEADERS[title])
-
-        return ws
-
-# ---- AUTH FIRST (FIXED ORDER) ----
 gc = sheet_client()
 sheet = gc.open_by_key(GOOGLE_SHEET_ID)
 
-state_ws   = get_or_create_worksheet(sheet, "state")
-history_ws = get_or_create_worksheet(sheet, "history")
-stocks_ws  = get_or_create_worksheet(sheet, "stocks")
-sector_ws  = get_or_create_worksheet(sheet, "sectors")
+def get_ws(name, headers):
+    try:
+        return sheet.worksheet(name)
+    except:
+        ws = sheet.add_worksheet(name, rows=200, cols=20)
+        ws.append_row(headers)
+        return ws
+
+state_ws   = get_ws("state",   ["key", "value"])
+stocks_ws  = get_ws("stocks",  ["symbol", "score", "bucket", "size", "health", "sector"])
+history_ws = get_ws("history", ["date", "symbol", "event", "detail"])
 
 # ==========================================================
-# SAFE DOWNLOAD (yfinance 1.1.0)
+# MARKET DATA
 # ==========================================================
-
 def safe_download(ticker, days=80):
     try:
         df = yf.download(ticker, period=f"{days}d", progress=False)
@@ -111,35 +90,24 @@ def safe_download(ticker, days=80):
     except:
         return None
 
-# ==========================================================
-# THREADED BATCH DOWNLOAD
-# ==========================================================
-
-def batch_download(tickers, days=80):
-    results = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(safe_download, t, days): t
-            for t in tickers
-        }
-        for future in as_completed(futures):
-            sym = futures[future]
-            try:
-                df = future.result()
-                if df is not None:
-                    results[sym] = df
-            except:
-                pass
-    return results
+def batch_download(tickers):
+    out = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        fut = {ex.submit(safe_download, t): t for t in tickers}
+        for f in as_completed(fut):
+            if f.result() is not None:
+                out[fut[f]] = f.result()
+    return out
 
 # ==========================================================
-# TREND HEALTH
+# SCORING ENGINE
 # ==========================================================
-
 def trend_health(df):
-    ema20 = ta.ema(df["Close"], 20).iloc[-1]
+    if len(df) < 25:
+        return "UNKNOWN", 0
+    ema = ta.ema(df["Close"], 20).iloc[-1]
     price = df["Close"].iloc[-1]
-    stretch = (price - ema20) / ema20 * 100
+    stretch = (price - ema) / ema * 100
 
     if stretch > 4:
         return "OVERSTRETCHED", round(stretch, 2)
@@ -147,17 +115,14 @@ def trend_health(df):
         return "DEEP_PULLBACK", round(stretch, 2)
     return "HEALTHY", round(stretch, 2)
 
-# ==========================================================
-# STOCK SCORING
-# ==========================================================
-
 def score_stock(df):
-    rsi = ta.rsi(df["Close"], 14).iloc[-1]
-    health, stretch = trend_health(df)
+    rsi_series = ta.rsi(df["Close"], 14)
+    rsi = 50 if rsi_series is None or pd.isna(rsi_series.iloc[-1]) else rsi_series.iloc[-1]
 
+    health, _ = trend_health(df)
     score = 0
-    score += 30 if rsi > 60 else 15 if rsi > 50 else 5
 
+    score += 30 if rsi > 60 else 15 if rsi > 50 else 5
     if health == "OVERSTRETCHED":
         score -= 20
     elif health == "HEALTHY":
@@ -165,155 +130,121 @@ def score_stock(df):
 
     return max(0, min(100, int(score))), health
 
-# ==========================================================
-# BUCKET & POSITION SIZING
-# ==========================================================
-
 def assign_bucket(score):
-    if score >= 80:
-        return "STRONG_BUY"
-    if score >= 65:
-        return "BUY"
-    if score >= 50:
-        return "WATCHLIST"
+    if score >= 80: return "STRONG_BUY"
+    if score >= 65: return "BUY"
+    if score >= 50: return "WATCHLIST"
     return "AVOID"
 
 def position_size(bucket):
-    return {
-        "STRONG_BUY": 0.25,
-        "BUY": 0.15,
-        "WATCHLIST": 0.05
-    }.get(bucket, 0)
+    return {"STRONG_BUY": 0.25, "BUY": 0.15, "WATCHLIST": 0.05}.get(bucket, 0)
 
 # ==========================================================
-# DYNAMIC UNIVERSE UPDATE
+# MORNING ENGINE (FIXED TOP-5 LOGIC)
 # ==========================================================
+def morning_run():
+    send_msg("🌅 Morning Scan Started")
 
-def dynamic_universe_update(active, reserve):
-    updated = active.copy()
+    STOCKS = {
+        "HDFCBANK.NS": "BANK", "ICICIBANK.NS": "BANK", "SBIN.NS": "BANK",
+        "INFY.NS": "IT", "TCS.NS": "IT",
+        "RELIANCE.NS": "ENERGY", "LT.NS": "INFRA",
+        "TATASTEEL.NS": "METAL", "JSWSTEEL.NS": "METAL",
+        "SUNPHARMA.NS": "PHARMA"
+    }
 
-    prev_state = state_ws.get_all_records()
-    prev_health = {}
-    if prev_state:
+    prev_state = {}
+    rows = state_ws.get_all_records()
+    if rows:
         try:
-            prev_health = json.loads(prev_state[0]["value"]).get("health", {})
+            prev_state = json.loads(rows[0]["value"]).get("health", {})
         except:
-            pass
+            prev_state = {}
 
-    reserve_data = batch_download(reserve)
-
-    for sym, df in reserve_data.items():
-        score, health = score_stock(df)
-
-        allow = False
-        if health == "HEALTHY":
-            allow = True
-        if prev_health.get(sym) == "OVERSTRETCHED" and health == "HEALTHY":
-            allow = True
-
-        if score >= 65 and allow:
-            weakest = min(updated, key=lambda x: x["score"])
-            if weakest["score"] < score:
-                updated.remove(weakest)
-                updated.append({
-                    "symbol": sym,
-                    "score": score,
-                    "bucket": assign_bucket(score),
-                    "health": health
-                })
-
-    return updated
-
-# ==========================================================
-# MAIN
-# ==========================================================
-
-def main():
-    print("🚀 Morning Report Running...")
-
-    prev_state = state_ws.get_all_records()
-    prev_top = []
-    prev_health = {}
-
-    if prev_state:
-        try:
-            payload = json.loads(prev_state[0]["value"])
-            prev_top = payload.get("top", [])
-            prev_health = payload.get("health", {})
-        except:
-            pass
-
-    STOCK_UNIVERSE = [
-        "HDFCBANK", "ICICIBANK", "SBIN",
-        "INFY", "TCS",
-        "RELIANCE", "LT",
-        "TATASTEEL", "JSWSTEEL",
-        "SUNPHARMA"
-    ]
-
-    RESERVE_UNIVERSE = [
-        "AXISBANK", "KOTAKBANK",
-        "WIPRO", "HCLTECH",
-        "ONGC", "POWERGRID"
-    ]
-
-    stock_data = batch_download(STOCK_UNIVERSE)
-
+    data = batch_download(STOCKS.keys())
     ranked = []
-    health_map = {}
 
-    for sym, df in stock_data.items():
+    for sym, df in data.items():
         score, health = score_stock(df)
-        ranked.append({
-            "symbol": sym,
-            "score": score,
-            "bucket": assign_bucket(score),
-            "health": health
-        })
-        health_map[sym] = health
 
-    ranked.sort(key=lambda x: x["score"], reverse=True)
-    top5 = dynamic_universe_update(ranked[:5], RESERVE_UNIVERSE)
-
-    alloc = 0
-    allocations = []
-
-    for s in sorted(top5, key=lambda x: x["score"], reverse=True):
-        size = position_size(s["bucket"])
-        size = min(size, GLOBAL_EXPOSURE_CAP - alloc)
-        if size <= 0:
-            continue
-        alloc += size
-        s["size"] = round(size * 100, 1)
-        allocations.append(s)
-
-    state_ws.clear()
-    state_ws.append_row([
-        "state",
-        json.dumps({
-            "date": str(ist_today()),
-            "top": allocations,
-            "health": health_map
-        })
-    ])
-
-    lines = ["🏛️ Institutional Stock Advisor\n"]
-    for s in allocations:
-        lines.append(
-            f"{s['symbol']} | {s['bucket']} | "
-            f"Score: {s['score']} | "
-            f"Size: {s['size']}% | "
-            f"Trend: {s['health']}"
+        # Pullback re-entry condition
+        allow = (
+            health == "HEALTHY" or
+            (prev_state.get(sym) == "OVERSTRETCHED" and health == "HEALTHY")
         )
 
-    send_msg("\n".join(lines))
+        if allow:
+            ranked.append({
+                "symbol": sym,
+                "score": score,
+                "bucket": assign_bucket(score),
+                "health": health,
+                "sector": STOCKS[sym]
+            })
+
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+
+    total_alloc = 0
+    sector_alloc = defaultdict(float)
+    final = []
+
+    # 🔥 FIX: iterate full ranked list until 5 filled
+    for s in ranked:
+        if len(final) == 5:
+            break
+
+        size = position_size(s["bucket"])
+        if total_alloc + size > GLOBAL_EXPOSURE_CAP:
+            continue
+        if sector_alloc[s["sector"]] + size > SECTOR_CAP:
+            send_msg(f"⚠️ Sector Concentration Alert: {s['sector']}")
+            continue
+
+        total_alloc += size
+        sector_alloc[s["sector"]] += size
+        s["size"] = round(size * 100, 1)
+        final.append(s)
+
+    # Persist state
+    health_map = {s["symbol"]: s["health"] for s in ranked}
+    state_ws.clear()
+    state_ws.append_row(["state", json.dumps({"date": ist_today(), "health": health_map})])
+
+    stocks_ws.clear()
+    stocks_ws.append_row(["symbol", "score", "bucket", "size", "health", "sector"])
+    for s in final:
+        stocks_ws.append_row([s[k] for k in ["symbol","score","bucket","size","health","sector"]])
+
+    msg = [f"🏛️ Top Picks — {ist_today()}", ""]
+    for s in final:
+        msg.append(
+            f"• {s['symbol']} | {s['bucket']} | {s['score']} | {s['size']}% | {s['health']}"
+        )
+
+    send_msg("\n".join(msg))
 
 # ==========================================================
-# KEEP ALIVE
+# EOD ENGINE (EXIT + HEALTH PERSISTENCE)
 # ==========================================================
+def eod_run():
+    send_msg("📊 EOD Analytics Ready")
 
+    prev = {r["symbol"]: int(r["score"]) for r in stocks_ws.get_all_records()}
+    data = batch_download(prev.keys())
+
+    for sym, df in data.items():
+        score, health = score_stock(df)
+
+        if prev[sym] - score >= EXIT_SCORE_DROP:
+            send_msg(f"❌ EXIT SIGNAL: {sym} | Score Drop {prev[sym] - score}")
+            history_ws.append_row([ist_today(), sym, "EXIT", f"Score {prev[sym]} → {score}"])
+
+# ==========================================================
+# BOOTSTRAP
+# ==========================================================
 if __name__ == "__main__":
-    keep_alive(lambda: send_msg("📊 EOD Analytics Ready"))
-    main()
+    keep_alive(eod_callback=eod_run)
+    morning_run()
+
     while True:
         time.sleep(3600)
