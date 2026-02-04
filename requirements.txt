@@ -1,26 +1,37 @@
-# Core
-python-dateutil
-pytz
-requests
+# Core runtime
+python-dateutil>=2.9.0
+pytz>=2025.2
+requests>=2.32.5
 
-# Data & Markets
-yfinance==1.1.0
+# Data & analytics
 pandas>=3.0.0
-numpy>=2.0.0
-pandas-ta
+numpy>=2.2.6
+yfinance>=1.1.0
+pandas-ta>=0.4.71b0
 
-# Google Sheets (Persistence Layer)
-gspread
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
+# Concurrency & performance
+tqdm>=4.67.3
 
-# News & Sentiment (VADER)
-nltk
+# Google Sheets integration
+gspread>=6.2.1
+google-auth>=2.48.0
+google-auth-oauthlib>=1.2.4
+google-auth-httplib2>=0.3.0
 
-# Web Server (Render keep-alive)
-flask
-gunicorn
+# Web server (Render requirement)
+flask>=3.1.2
+gunicorn>=25.0.1
 
-# Utilities
-tqdm
+# NLP & sentiment
+nltk>=3.9.2
+beautifulsoup4>=4.14.3
+
+# Crypto / SSL (required by requests + google auth)
+cryptography>=46.0.4
+cffi>=2.0.0
+
+# Misc dependencies (pulled by yfinance)
+urllib3>=2.6.3
+charset-normalizer>=3.4.4
+idna>=3.11
+certifi>=2026.1.4
