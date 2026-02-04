@@ -1,6 +1,7 @@
 # ==========================================================
-# 🔁 KEEP ALIVE — RENDER SAFE + NON-BLOCKING (2026)
+# 🔁 KEEP ALIVE — RENDER SAFE + NON-BLOCKING (2026 STABLE)
 # ==========================================================
+
 import os
 import json
 import threading
@@ -18,18 +19,17 @@ PORT = int(os.getenv("PORT", 10000))
 IST = pytz.timezone("Asia/Kolkata")
 
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-SERVICE_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+SERVICE_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 
 STATE_KEY = "last_eod_run"
 
 # ----------------------------------------------------------
-# FLASK APP
+# FLASK APP (Render Health Check)
 # ----------------------------------------------------------
 app = Flask(__name__)
 
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
-    """Render health check endpoint"""
     return "OK", 200
 
 # ----------------------------------------------------------
@@ -38,11 +38,11 @@ def health_check():
 def get_sheet():
     """
     Always returns a fresh Google Sheet handle.
-    Prevents stale OAuth sessions in long-running Render apps.
+    Prevents stale OAuth sessions in long-running apps.
     """
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(
-        json.loads(SERVICE_JSON), scopes=scopes
+        SERVICE_JSON, scopes=scopes
     )
     gc = gspread.authorize(creds)
     return gc.open_by_key(GOOGLE_SHEET_ID)
@@ -60,6 +60,9 @@ def get_state_ws():
 # STATE HELPERS
 # ----------------------------------------------------------
 def get_last_eod_run():
+    """
+    Reads last EOD execution date from Google Sheets.
+    """
     try:
         ws = get_state_ws()
         for row in ws.get_all_records():
@@ -70,6 +73,9 @@ def get_last_eod_run():
     return None
 
 def set_last_eod_run(date_str):
+    """
+    Saves EOD execution date to Google Sheets.
+    """
     try:
         ws = get_state_ws()
         rows = ws.get_all_records()
@@ -85,12 +91,12 @@ def set_last_eod_run(date_str):
         print("⚠️ Error writing EOD state:", e)
 
 # ----------------------------------------------------------
-# EOD CALLBACK RUNNER
+# EOD CALLBACK RUNNER (ONCE PER IST DAY)
 # ----------------------------------------------------------
 def eod_runner(callback):
     """
-    Triggers EOD callback ONCE per IST day.
-    Survives restarts, redeploys, crashes.
+    Runs EOD callback exactly ONCE per IST day.
+    Independent of restarts, redeploys, or crashes.
     """
     while True:
         try:
@@ -115,7 +121,7 @@ def keep_alive(eod_callback=None):
     """
     Starts:
     1️⃣ Flask health server (Render requirement)
-    2️⃣ Optional EOD scheduler (non-blocking)
+    2️⃣ Optional EOD scheduler (non-blocking, internal)
     """
 
     # 1️⃣ Start EOD Scheduler
@@ -127,7 +133,7 @@ def keep_alive(eod_callback=None):
         ).start()
         print("✅ EOD Scheduler started in background.")
 
-    # 2️⃣ Start Flask server (non-blocking)
+    # 2️⃣ Start Flask Server (non-blocking)
     threading.Thread(
         target=lambda: app.run(
             host="0.0.0.0",
