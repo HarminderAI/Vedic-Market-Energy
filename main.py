@@ -1,4 +1,8 @@
-import os, json, datetime, time
+# ==========================================================
+# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL (2026)
+# ==========================================================
+
+import os, json, time, datetime
 import requests
 import pytz
 import yfinance as yf
@@ -6,10 +10,22 @@ import pandas as pd
 import pandas_ta as ta
 import gspread
 from google.oauth2.service_account import Credentials
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Ops & modules
 from keep_alive import keep_alive
 from news_logic import fetch_market_news, format_news_block
+
+# ==========================================================
+# TIMEZONE (IST LOCK)
+# ==========================================================
+
+IST = pytz.timezone("Asia/Kolkata")
+
+def ist_now():
+    return datetime.datetime.now(IST)
+
+def ist_today():
+    return ist_now().date()
 
 # ==========================================================
 # CONFIG
@@ -23,23 +39,14 @@ SERVICE_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 
 SAFE_RSI = 50.0
 SAFE_VIX = 15.0
-SUCCESS_THRESHOLD = 0.20  # %
 
-ANALYTICS_LOOKBACK = 100
-VOLUME_SPIKE_MULTIPLIER = 2.0
+SUCCESS_THRESHOLD = 0.20
+EXIT_SCORE_DROP = 15
 
-IST = pytz.timezone("Asia/Kolkata")
+TOTAL_CAPITAL = 1.0
+GLOBAL_EXPOSURE_CAP = 0.90
 
-SECTORS = {
-    "PSU": "^CNXPSUBANK",
-    "Infra": "^CNXINFRA",
-    "IT": "^CNXIT",
-    "BANK": "^NSEBANK",
-    "FMCG": "^CNXFMCG",
-    "AUTO": "^CNXAUTO",
-    "METAL": "^CNXMETAL",
-    "PHARMA": "^CNXPHARMA"
-}
+MAX_WORKERS = 5   # Yahoo-safe in 2026
 
 # ==========================================================
 # GOOGLE SHEETS
@@ -52,8 +59,11 @@ def sheet_client():
 
 gc = sheet_client()
 sheet = gc.open_by_key(GOOGLE_SHEET_ID)
-state_ws = sheet.worksheet("state")
+
+state_ws   = sheet.worksheet("state")
 history_ws = sheet.worksheet("history")
+stocks_ws  = sheet.worksheet("stocks")
+sector_ws  = sheet.worksheet("sectors")
 
 # ==========================================================
 # TELEGRAM
@@ -70,208 +80,242 @@ def send_msg(text):
         pass
 
 # ==========================================================
-# TIME FILTER — VEDIC WINDOW
+# SAFE DOWNLOAD (yfinance 1.1.0)
 # ==========================================================
 
-def is_vedic_trade_window():
-    """
-    Allowed trading window:
-    09:30 AM – 03:00 PM IST
-    """
-    now = datetime.datetime.now(IST).time()
-    return datetime.time(9, 30) <= now <= datetime.time(15, 0)
-
-# ==========================================================
-# SAFE MARKET DOWNLOAD
-# ==========================================================
-
-def safe_download(ticker, days=None, interval=None):
+def safe_download(ticker, days=80):
     try:
-        df = yf.download(
-            ticker,
-            period=f"{days}d" if days else None,
-            interval=interval,
-            progress=False
-        )
+        df = yf.download(ticker, period=f"{days}d", progress=False)
         if df is None or df.empty:
             return None
-        df.columns = df.columns.get_level_values(0)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         return df
     except:
         return None
 
 # ==========================================================
-# TREND HEALTH (EMA20 STRETCH)
+# THREADED BATCH DOWNLOAD (RATE-LIMIT SAFE)
 # ==========================================================
 
-def trend_health(nifty_df):
-    ema20 = ta.ema(nifty_df["Close"], 20).iloc[-1]
-    close = nifty_df["Close"].iloc[-1]
-    stretch = ((close - ema20) / ema20) * 100
-
-    if abs(stretch) > 4:
-        return "OVERSTRETCHED", round(stretch, 2), -20
-    elif abs(stretch) > 2:
-        return "EXTENDED", round(stretch, 2), -10
-    else:
-        return "HEALTHY", round(stretch, 2), 0
-
-# ==========================================================
-# MARKET REGIME
-# ==========================================================
-
-def market_regime_from_df(nifty_df):
-    try:
-        adx = ta.adx(
-            nifty_df["High"], nifty_df["Low"], nifty_df["Close"]
-        )["ADX_14"].iloc[-1]
-
-        atr = ta.atr(
-            nifty_df["High"], nifty_df["Low"], nifty_df["Close"]
-        ).iloc[-1]
-
-        vol = nifty_df["Close"].pct_change().std()
-
-        if adx > 25 and atr > vol:
-            return "CONFIRMED_TREND", 100
-        if atr > vol * 1.5:
-            return "VOLATILE", 40
-        return "RANGE", 35
-    except:
-        return "UNKNOWN", 30
+def batch_download(tickers, days=80):
+    results = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(safe_download, t, days): t
+            for t in tickers
+        }
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                df = future.result()
+                if df is not None:
+                    results[sym] = df
+            except:
+                continue
+    return results
 
 # ==========================================================
-# SECTOR ROTATION + BREADTH
+# TREND HEALTH
 # ==========================================================
 
-def sector_rotation_from_df(nifty_df):
-    out = {}
-    breadth = 0
+def trend_health(df):
+    ema20 = ta.ema(df["Close"], 20).iloc[-1]
+    price = df["Close"].iloc[-1]
+    stretch = (price - ema20) / ema20 * 100
 
-    nifty_20d_ago = nifty_df["Close"].iloc[-20]
-    nifty_ret = (nifty_df["Close"].iloc[-1] / nifty_20d_ago - 1) * 100
-
-    for k, t in SECTORS.items():
-        df = safe_download(t, 20)
-        if df is None:
-            out[k] = 0.0
-            continue
-
-        sec_ret = (df["Close"].iloc[-1] / df["Close"].iloc[0] - 1) * 100
-        alpha = round(sec_ret - nifty_ret, 2)
-        out[k] = alpha
-
-        if alpha > 0:
-            breadth += 1
-
-    return out, breadth
+    if stretch > 4:
+        return "OVERSTRETCHED", round(stretch, 2)
+    if stretch < -2:
+        return "DEEP_PULLBACK", round(stretch, 2)
+    return "HEALTHY", round(stretch, 2)
 
 # ==========================================================
-# INTRADAY VOLUME SPIKE
+# STOCK SCORING
 # ==========================================================
 
-def detect_volume_spike():
-    if not is_vedic_trade_window():
-        return
+def score_stock(df):
+    rsi = ta.rsi(df["Close"], 14).iloc[-1]
+    ema_health, stretch = trend_health(df)
 
-    df = safe_download("^NSEI", interval="15m", days=2)
-    if df is None or len(df) < 12:
-        return
+    score = 0
+    score += 30 if rsi > 60 else 15 if rsi > 50 else 5
 
-    current_vol = df["Volume"].iloc[-1]
-    avg_vol = df["Volume"].iloc[-11:-1].mean()
+    if ema_health == "OVERSTRETCHED":
+        score -= 20
+    elif ema_health == "HEALTHY":
+        score += 10
 
-    if current_vol > avg_vol * VOLUME_SPIKE_MULTIPLIER:
-        send_msg("🚨 Institutional Footprint Detected!\n15-min Volume Spike on NIFTY")
+    return max(0, min(100, int(score))), ema_health
 
 # ==========================================================
-# TRADE SETUP ENGINE
+# BUCKET ASSIGNMENT
 # ==========================================================
 
-def entry_engine(nifty_df, regime):
-    atr = ta.atr(
-        nifty_df["High"], nifty_df["Low"], nifty_df["Close"]
-    ).iloc[-1]
+def assign_bucket(score):
+    if score >= 80:
+        return "STRONG_BUY"
+    if score >= 65:
+        return "BUY"
+    if score >= 50:
+        return "WATCHLIST"
+    return "AVOID"
 
-    price = nifty_df["Close"].iloc[-1]
+# ==========================================================
+# POSITION SIZING
+# ==========================================================
 
-    if regime == "VOLATILE":
-        sl = atr * 2.0
-    elif regime == "RANGE":
-        sl = atr * 1.2
-    else:
-        sl = atr * 1.5
-
-    tp = sl * 2
-
+def position_size(bucket):
     return {
-        "Entry": round(price, 2),
-        "SL": round(price - sl, 2),
-        "TP": round(price + tp, 2)
-    }
+        "STRONG_BUY": 0.25,
+        "BUY": 0.15,
+        "WATCHLIST": 0.05
+    }.get(bucket, 0)
 
 # ==========================================================
-# MAIN (DAILY REPORT)
+# DYNAMIC UNIVERSE UPDATE (PATCHED)
+# ==========================================================
+
+def dynamic_universe_update(active, reserve):
+    updated = active.copy()
+
+    # Load previous health state
+    prev_state = state_ws.get_all_records()
+    prev_health = {}
+    if prev_state:
+        try:
+            prev_health = json.loads(prev_state[0]["health"])
+        except:
+            prev_health = {}
+
+    reserve_data = batch_download(reserve)
+
+    for sym, df in reserve_data.items():
+        score, health = score_stock(df)
+
+        # PROMOTION RULES
+        allow = False
+
+        if health == "HEALTHY":
+            allow = True
+
+        # Pullback re-promotion
+        if prev_health.get(sym) == "OVERSTRETCHED" and health == "HEALTHY":
+            allow = True
+
+        if score >= 65 and allow:
+            weakest = min(updated, key=lambda x: x["score"])
+            if weakest["score"] < score:
+                updated.remove(weakest)
+                updated.append({
+                    "symbol": sym,
+                    "score": score,
+                    "bucket": assign_bucket(score),
+                    "health": health
+                })
+
+    return updated
+
+# ==========================================================
+# MAIN
 # ==========================================================
 
 def main():
-    nifty = safe_download("^NSEI", 80)
-    vix = safe_download("^INDIAVIX", 10)
+    print("🚀 Morning Report Running...")
 
-    if nifty is None:
-        send_msg("❌ Market data unavailable.")
-        return
+    # ---- Load state
+    prev_state = state_ws.get_all_records()
+    prev_top = []
+    prev_health = {}
 
-    rsi = ta.rsi(nifty["Close"], 14).iloc[-1]
-    regime, score_cap = market_regime_from_df(nifty)
+    if prev_state:
+        try:
+            payload = json.loads(prev_state[0]["value"])
+            prev_top = payload.get("top", [])
+            prev_health = payload.get("health", {})
+        except:
+            pass
 
-    trend_state, stretch, trend_penalty = trend_health(nifty)
-    sectors, breadth = sector_rotation_from_df(nifty)
+    # ---- Stock universe
+    STOCK_UNIVERSE = [
+        "HDFCBANK", "ICICIBANK", "SBIN",
+        "INFY", "TCS",
+        "RELIANCE", "LT",
+        "TATASTEEL", "JSWSTEEL",
+        "SUNPHARMA"
+    ]
 
-    sentiment, subjectivity, headlines = fetch_market_news()
-    news_block = format_news_block(sentiment, subjectivity, headlines)
+    RESERVE_UNIVERSE = [
+        "AXISBANK", "KOTAKBANK",
+        "WIPRO", "HCLTECH",
+        "ONGC", "POWERGRID"
+    ]
 
-    score = (
-        (20 if rsi > 55 else 10) +
-        (10 if breadth >= 5 else 0) +
-        (10 if sentiment > 0 else 5) +
-        trend_penalty
-    )
+    stock_data = batch_download(STOCK_UNIVERSE)
 
-    score = min(score, score_cap)
-    bias = "BULLISH" if score >= 65 else "NEUTRAL"
+    ranked = []
+    health_map = {}
 
-    setup = entry_engine(nifty, regime)
+    for sym, df in stock_data.items():
+        score, health = score_stock(df)
+        ranked.append({
+            "symbol": sym,
+            "score": score,
+            "bucket": assign_bucket(score),
+            "health": health
+        })
+        health_map[sym] = health
 
-    sector_text = "\n".join([f"• {k}: {v:+.2f}%" for k, v in sectors.items()])
+    ranked = sorted(ranked, key=lambda x: x["score"], reverse=True)
+    top5 = ranked[:5]
 
-    send_msg(
-        "🏛️ Institutional Market Report\n"
-        f"RSI: {round(rsi,2)}\n"
-        f"Regime: {regime}\n"
-        f"Trend Health: {trend_state} ({stretch:+.2f}%)\n"
-        f"Breadth: {breadth}/8\n\n"
-        f"{news_block}\n\n"
-        f"Sector Rotation:\n{sector_text}\n\n"
-        f"Trade Setup (If Any):\n"
-        f"Entry: {setup['Entry']}\n"
-        f"SL: {setup['SL']}\n"
-        f"TP: {setup['TP']}\n\n"
-        f"Score: {score}/100\n"
-        f"Bias: {bias}\n\n"
-        "⚠️ Not SEBI Advice"
-    )
+    # ---- Dynamic universe upgrade
+    top5 = dynamic_universe_update(top5, RESERVE_UNIVERSE)
+
+    # ---- Position sizing (sorted by score)
+    alloc = 0
+    allocations = []
+
+    for s in sorted(top5, key=lambda x: x["score"], reverse=True):
+        size = position_size(s["bucket"])
+        size = min(size, GLOBAL_EXPOSURE_CAP - alloc)
+        if size <= 0:
+            continue
+        alloc += size
+        s["size"] = round(size * 100, 1)
+        allocations.append(s)
+
+    # ---- Save state
+    state_ws.clear()
+    state_ws.append_row([
+        "state",
+        json.dumps({
+            "date": str(ist_today()),
+            "top": allocations,
+            "health": health_map
+        })
+    ])
+
+    # ---- Telegram report
+    lines = ["🏛️ Institutional Stock Advisor\n"]
+
+    for s in allocations:
+        lines.append(
+            f"{s['symbol']} | {s['bucket']} | "
+            f"Score: {s['score']} | "
+            f"Size: {s['size']}% | "
+            f"Trend: {s['health']}"
+        )
+
+    send_msg("\n".join(lines))
 
 # ==========================================================
-# BOOTSTRAP (RENDER SAFE)
+# KEEP ALIVE
 # ==========================================================
 
 if __name__ == "__main__":
-    keep_alive(lambda: None)
-
-    print("🚀 Morning Report Running...")
+    keep_alive(lambda: send_msg("📊 EOD Analytics Ready"))
     main()
 
     while True:
-        detect_volume_spike()
-        time.sleep(900)  # 15 minutes
+        time.sleep(3600)
