@@ -49,6 +49,28 @@ GLOBAL_EXPOSURE_CAP = 0.90
 MAX_WORKERS = 5   # Yahoo-safe in 2026
 
 # ==========================================================
+# GOOGLE SHEETS INITIALIZATION (SAFE MODE)
+# ==========================================================
+
+def get_or_create_worksheet(spreadsheet, title, rows=100, cols=20):
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"⚠️ Worksheet '{title}' not found. Creating it now...")
+        # Create the sheet with default dimensions
+        new_sheet = spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
+        # Optional: Add headers if it's a new sheet
+        if title == "stocks":
+            new_sheet.append_row(["symbol", "score", "bucket", "size", "trend_health", "sector"])
+        return new_sheet
+
+# Update your main setup:
+state_ws   = get_or_create_worksheet(sheet, "state")
+history_ws = get_or_create_worksheet(sheet, "history")
+stocks_ws  = get_or_create_worksheet(sheet, "stocks")
+sector_ws  = get_or_create_worksheet(sheet, "sectors")
+
+# ==========================================================
 # GOOGLE SHEETS
 # ==========================================================
 
