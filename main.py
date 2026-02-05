@@ -1,5 +1,5 @@
 # ==========================================================
-# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — HOTFIX (v2.4)
+# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — DIAMOND (v2.6)
 # ==========================================================
 
 import os, json, time, datetime, threading, io
@@ -18,7 +18,6 @@ from news_logic import fetch_market_news, format_news_block
 # CONFIG & CONSTANTS
 # ==========================================================
 IST = pytz.timezone("Asia/Kolkata")
-MAX_WORKERS = 5
 SECTOR_CAP = 2          # Max buys per sector
 MIN_VOL_FLOOR = 100000  # Minimum daily volume to trade
 MIN_PRICE = 50          # Penny stock filter
@@ -74,7 +73,7 @@ history_ws = safe_sheet("history", ["date","symbol","action","price","stop_loss"
 memory_ws = safe_sheet("memory", ["date", "squeezing_symbols_csv"])
 
 # ==========================================================
-# DATA ENGINE (HARDENED & DEDUPLICATED)
+# DATA ENGINE (BULK DOWNLOADER - THREAD SAFE)
 # ==========================================================
 HARDCODED_FALLBACK = [
     "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
@@ -91,7 +90,6 @@ def load_nifty_200_and_sectors():
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Referer": "https://www.nseindia.com/",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
             "Connection": "keep-alive"
         }
         
@@ -117,42 +115,54 @@ def load_nifty_200_and_sectors():
         print(f"NSE Download Error: {e}")
         return HARDCODED_FALLBACK, {s: "Bluechip" for s in HARDCODED_FALLBACK}
 
-def safe_download(symbol, days=100):
-    # Retry Logic for Yahoo Flakiness
-    for attempt in range(2):
-        try:
-            time.sleep(0.1 + (hash(symbol) % 10) / 100.0) 
-            df = yf.download(symbol, period=f"{days}d", auto_adjust=True, progress=False)
-            
-            if df is None or df.empty: return None
-            
-            # 🛡️ FIX 1: Flatten MultiIndex & Remove Duplicates
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            
-            # Remove duplicate columns (e.g. two 'Close' columns)
-            df = df.loc[:, ~df.columns.duplicated()]
-                
-            return df.dropna()
-        except:
-            if attempt == 0: time.sleep(1)
-            continue
-    return None
-
 def batch_download(symbols):
-    data = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(safe_download, s): s for s in symbols}
-        for f in as_completed(futures):
-            df = f.result()
-            if df is not None:
-                data[futures[f]] = df
-    return data
+    """Downloads stocks in chunks of 50 to prevent data mixing."""
+    print(f"⬇️ Downloading data for {len(symbols)} stocks (Bulk Mode)...")
+    data_map = {}
+    
+    # Chunk symbols (50 at a time)
+    chunk_size = 50
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i:i + chunk_size]
+        try:
+            # BULK DOWNLOAD: Single request, Thread-Safe
+            df = yf.download(chunk, period="100d", group_by='ticker', auto_adjust=True, progress=False, threads=True)
+            
+            # Parse the MultiIndex DataFrame
+            for sym in chunk:
+                try:
+                    if len(chunk) == 1:
+                        stock_df = df.copy()
+                    else:
+                        if sym not in df.columns: continue
+                        stock_df = df[sym].copy()
+                    
+                    # Clean Empty Data
+                    if stock_df is None or stock_df.empty: continue
+                    
+                    # Remove duplicate columns if any (Yahoo Bug Fix)
+                    stock_df = stock_df.loc[:, ~stock_df.columns.duplicated()]
+                    stock_df = stock_df.dropna()
+                    
+                    if len(stock_df) > 50:
+                        data_map[sym] = stock_df
+                except Exception as e:
+                    continue 
+                    
+        except Exception as e:
+            print(f"Chunk Error: {e}")
+            time.sleep(1)
+            
+    print(f"✅ Successfully processed {len(data_map)} stocks.")
+    return data_map
 
 # ==========================================================
-# SMART ANALYST ENGINE (SCALAR SAFE)
+# SMART ANALYST ENGINE (SCALAR SAFE & ISOLATED)
 # ==========================================================
 def score_stock(df, was_squeezing):
+    # 🛡️ FIX: Deep Copy to ensure total data isolation
+    df = df.copy()
+
     if len(df) < 50: return None
     
     close = df["Close"]
@@ -160,7 +170,7 @@ def score_stock(df, was_squeezing):
     low = df["Low"]
     volume = df["Volume"]
 
-    # 🛡️ FIX 2: Force scalar float to prevent Series Ambiguity error
+    # Force scalar float
     try:
         price = float(close.iloc[-1])
     except:
@@ -305,7 +315,7 @@ def morning_run():
         macro_risk_off = True
         send_msg("⚠️ *Macro Alert:* High Noise. Filtering aggressive setups.")
 
-    # 3. PROCESS DATA
+    # 3. PROCESS DATA (BULK MODE)
     symbols, sector_map = load_nifty_200_and_sectors()
     data = batch_download(symbols)
     
@@ -423,3 +433,4 @@ if __name__ == "__main__":
             send_msg(f"💀 Bot Crash Alert: {e}") 
             time.sleep(900)
         time.sleep(3600)
+        
