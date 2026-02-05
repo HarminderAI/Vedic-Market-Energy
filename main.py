@@ -9,7 +9,6 @@ import pandas as pd
 import pandas_ta as ta
 import gspread
 from google.oauth2.service_account import Credentials
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from keep_alive import keep_alive
@@ -35,25 +34,21 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SERVICE_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 
 BASE_GLOBAL_EXPOSURE = 0.90
-SECTOR_CAP = 0.50
-EXIT_SCORE_DROP = 15
-
-# 5 is SAFE on Render (no IP blocks)
-# Increase to 8 only if server has ≥2 vCPUs
-MAX_WORKERS = 5
+MAX_WORKERS = 5          # SAFE for Render
+YF_THROTTLE = 0.35       # micro-throttle (seconds)
 
 # ==========================================================
 # TELEGRAM (DEDUP + THREAD SAFE)
 # ==========================================================
 msg_lock = threading.Lock()
 
-def send_msg(text, dedup_key=None):
+def send_msg(text, dedup_key=None, state_map=None):
     with msg_lock:
-        if dedup_key:
-            for r in state_ws.get_all_records():
-                if r.get("key") == dedup_key and r.get("value") == ist_today():
-                    return
+        if dedup_key and state_map is not None:
+            if state_map.get(dedup_key) == ist_today():
+                return
             _write_state(dedup_key, ist_today())
+            state_map[dedup_key] = ist_today()
 
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -80,15 +75,14 @@ def safe_sheet(name, headers):
         ws.append_row(headers)
         return ws
 
-state_ws   = safe_sheet("state", ["key", "value"])
-stocks_ws  = safe_sheet("stocks", ["symbol","score","bucket","size","health","sector","vol_ratio","squeeze"])
-history_ws = safe_sheet("history", ["date","symbol","event","detail"])
-archive_ws = safe_sheet("history_archive", ["date","symbol","event","detail"])
+state_ws  = safe_sheet("state", ["key", "value"])
+stocks_ws = safe_sheet("stocks", ["symbol","score","bucket","vol_ratio","squeeze"])
+ohlc_ws   = safe_sheet("ohlc_cache", ["date","symbol","json"])
 
 def _write_state(key, value):
     rows = state_ws.get_all_records()
     for i, r in enumerate(rows, start=2):
-        if r.get("key") == key:
+        if r["key"] == key:
             state_ws.update_cell(i, 2, value)
             return
     state_ws.append_row([key, value])
@@ -103,25 +97,54 @@ def load_nifty_200():
     return [f"{s}.NS" for s in df["Symbol"].tolist()]
 
 # ==========================================================
-# MARKET DATA
+# DAILY OHLC CACHE
 # ==========================================================
-def safe_download(ticker, days=90):
-    for _ in range(2):
-        try:
-            df = yf.download(ticker, period=f"{days}d", auto_adjust=True, progress=False)
-            if df is None or df.empty:
-                return None
-            if df.columns.nlevels > 1:
-                df.columns = df.columns.get_level_values(0)
-            return df.dropna()
-        except:
-            time.sleep(2)
+def get_cached_ohlc(symbol):
+    rows = ohlc_ws.get_all_records()
+    for r in rows:
+        if r["symbol"] == symbol and r["date"] == ist_today():
+            return pd.DataFrame(json.loads(r["json"]))
     return None
 
-def batch_download(tickers):
+def set_cached_ohlc(symbol, df):
+    payload = json.dumps(df.to_dict())
+    if len(payload) < 45000:
+        ohlc_ws.append_row([ist_today(), symbol, payload])
+
+# ==========================================================
+# MARKET DATA (with micro-throttle)
+# ==========================================================
+def safe_download(symbol, days=90):
+    cached = get_cached_ohlc(symbol)
+    if cached is not None:
+        return cached
+
+    time.sleep(YF_THROTTLE)
+
+    try:
+        df = yf.download(
+            symbol,
+            period=f"{days}d",
+            auto_adjust=True,
+            progress=False,
+            threads=False
+        )
+        if df is None or df.empty:
+            return None
+
+        if df.columns.nlevels > 1:
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.dropna()
+        set_cached_ohlc(symbol, df)
+        return df
+    except:
+        return None
+
+def batch_download(symbols):
     out = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(safe_download, t): t for t in tickers}
+        futures = {ex.submit(safe_download, s): s for s in symbols}
         for f in as_completed(futures):
             df = f.result()
             if df is not None:
@@ -132,180 +155,116 @@ def batch_download(tickers):
 # INDICATORS
 # ==========================================================
 def trend_health(df):
-    try:
-        close = df["Close"].dropna()
-        if len(close) < 25:
-            return "UNKNOWN", 0.0
+    close = df["Close"].dropna()
+    if len(close) < 25:
+        return "UNKNOWN"
 
-        ema_series = ta.ema(close, length=20)
-        if ema_series is None or ema_series.dropna().empty:
-            return "UNKNOWN", 0.0
+    ema = ta.ema(close, length=20)
+    if ema is None or ema.dropna().empty:
+        return "UNKNOWN"
 
-        ema = ema_series.dropna().iloc[-1]
-        price = close.iloc[-1]
-
-        stretch = (price - ema) / ema * 100
-
-        if stretch > 4:
-            return "OVERSTRETCHED", round(stretch, 2)
-        if stretch < -2:
-            return "DEEP_PULLBACK", round(stretch, 2)
-
-        return "HEALTHY", round(stretch, 2)
-
-    except Exception:
-        return "UNKNOWN", 0.0
+    stretch = (close.iloc[-1] - ema.iloc[-1]) / ema.iloc[-1] * 100
+    if stretch > 4:
+        return "OVERSTRETCHED"
+    if stretch < -2:
+        return "DEEP_PULLBACK"
+    return "HEALTHY"
 
 def score_stock(df):
-    try:
-        close = df["Close"].dropna()
-        high = df["High"].dropna()
-        low = df["Low"].dropna()
-        volume = df["Volume"].dropna()
+    close  = df["Close"].dropna()
+    high   = df["High"].dropna()
+    low    = df["Low"].dropna()
+    volume = df["Volume"].dropna()
 
-        if len(close) < 30 or len(volume) < 30:
-            return 0, 50, 1.0, False, False
+    if len(close) < 30:
+        return 0, 1.0, False, False
 
-        # ---------------- RSI ----------------
-        rsi_series = ta.rsi(close, length=14)
-        rsi_val = rsi_series.dropna().iloc[-1] if rsi_series is not None and not rsi_series.dropna().empty else 50
+    rsi = ta.rsi(close, length=14)
+    rsi_val = rsi.dropna().iloc[-1] if rsi is not None else 50
 
-        # ---------------- TREND HEALTH ----------------
-        health, _ = trend_health(df)
+    health = trend_health(df)
 
-        # ---------------- VOLUME BREAKOUT ----------------
-        vol_sma_series = volume.rolling(20).mean()
-        avg_vol = vol_sma_series.iloc[-1]
+    avg_vol = volume.rolling(20).mean().iloc[-1]
+    vol_ratio = round(volume.iloc[-1] / avg_vol, 2) if avg_vol and avg_vol > 0 else 1.0
 
-        if pd.isna(avg_vol) or avg_vol <= 0:
-            vol_ratio = 1.0
-        else:
-            vol_ratio = round(volume.iloc[-1] / avg_vol, 2)
+    bb = ta.bbands(close, length=20)
+    kc = ta.kc(high, low, close, length=20)
 
-        # ---------------- BOLLINGER + KELTNER (SQUEEZE) ----------------
-        bb = ta.bbands(close, length=20, std=2)
-        kc = ta.kc(high, low, close, length=20, scalar=1.5)
+    squeeze = False
+    breakout_up = False
 
-        is_squeezed = False
-        breakout_up = False
+    if bb is not None and kc is not None:
+        bb = bb.dropna()
+        kc = kc.dropna()
+        if not bb.empty and not kc.empty:
+            squeeze = (
+                bb.iloc[-1]["BBU_20_2.0"] < kc.iloc[-1]["KCUe_20_1.5"]
+                and bb.iloc[-1]["BBL_20_2.0"] > kc.iloc[-1]["KCLe_20_1.5"]
+            )
+            breakout_up = close.iloc[-1] > bb.iloc[-1]["BBU_20_2.0"]
 
-        if bb is not None and kc is not None:
-            bb = bb.dropna()
-            kc = kc.dropna()
+    score = 30 if rsi_val > 60 else 15 if rsi_val > 50 else 5
+    if health == "HEALTHY":
+        score += 10
+    if vol_ratio >= 1.5:
+        score += 10
+    if squeeze:
+        score += 5
 
-            if not bb.empty and not kc.empty:
-                upper_bb = bb.iloc[-1]["BBU_20_2.0"]
-                lower_bb = bb.iloc[-1]["BBL_20_2.0"]
-                upper_kc = kc.iloc[-1]["KCUe_20_1.5"]
-                lower_kc = kc.iloc[-1]["KCLe_20_1.5"]
-
-                is_squeezed = upper_bb < upper_kc and lower_bb > lower_kc
-
-                # Breakout confirmation: price above upper BB
-                breakout_up = close.iloc[-1] > upper_bb
-
-        # ---------------- SCORE ENGINE ----------------
-        score = 30 if rsi_val > 60 else 15 if rsi_val > 50 else 5
-
-        if health == "OVERSTRETCHED":
-            score -= 20
-        elif health == "HEALTHY":
-            score += 10
-
-        # Volume bonus
-        if vol_ratio >= 2.0:
-            score += 15
-        elif vol_ratio >= 1.5:
-            score += 10
-
-        # Squeeze charging bonus
-        if is_squeezed:
-            score += 5
-
-        score = max(0, min(100, int(score)))
-
-        return score, int(rsi_val), vol_ratio, is_squeezed, breakout_up
-
-    except Exception as e:
-        print("Score error:", e)
-        return 0, 50, 1.0, False, False
-
-# ==========================================================
-# HISTORY CLEANUP (90 DAYS)
-# ==========================================================
-def cleanup_history():
-    rows = history_ws.get_all_records()
-    cutoff = ist_now() - datetime.timedelta(days=90)
-
-    keep = []
-    for r in rows:
-        d = datetime.datetime.fromisoformat(r["date"])
-        if d < cutoff:
-            archive_ws.append_row([r["date"], r["symbol"], r["event"], r["detail"]])
-        else:
-            keep.append([r["date"], r["symbol"], r["event"], r["detail"]])
-
-    history_ws.clear()
-    history_ws.append_row(["date","symbol","event","detail"])
-    for row in keep:
-        history_ws.append_row(row)
+    return min(100, score), vol_ratio, squeeze, breakout_up
 
 # ==========================================================
 # MORNING ENGINE
 # ==========================================================
 def morning_run():
-    if any(r.get("key") == "last_morning_run" and r.get("value") == ist_today()
-           for r in state_ws.get_all_records()):
+    state_rows = state_ws.get_all_records()
+    state_map = {r["key"]: r["value"] for r in state_rows}
+
+    if state_map.get("last_morning_run") == ist_today():
         return
 
-    send_msg("🌅 *Morning Scan Started*", "morning_start")
+    send_msg("🌅 *Morning Scan Started*", "morning_start", state_map)
 
     news = fetch_market_news()
-    send_msg(format_news_block(news), "news")
+    send_msg(format_news_block(news), "news", state_map)
 
-    global_cap = BASE_GLOBAL_EXPOSURE
-    strong_buy_ok = True
-    if news["overall"] < -0.2:
-        global_cap *= 0.75
-    if news["noise"] > 0.6:
-        strong_buy_ok = False
+    strong_buy_ok = not (news["overall"] < -0.2 or news["noise"] > 0.6)
 
     universe = load_nifty_200()
     data = batch_download(universe)
 
     ranked = []
     for sym, df in data.items():
-        score, rsi, vol_ratio, squeeze, breakout_up = score_stock(df)
+        score, vol, squeeze, breakout = score_stock(df)
 
-        if score >= 80 and vol_ratio >= 1.5 and breakout_up and not squeeze and strong_buy_ok:
+        if score >= 80 and vol >= 1.5 and breakout and not squeeze and strong_buy_ok:
             bucket = "STRONG_BUY"
         elif score >= 65:
             bucket = "BUY"
         elif score >= 50:
-            bucket = "WATCHLIST"
+            bucket = "WATCH"
         else:
             continue
 
-        ranked.append((sym, score, bucket, vol_ratio, squeeze))
+        ranked.append((sym, score, bucket, vol, squeeze))
 
     ranked.sort(key=lambda x: x[1], reverse=True)
     final = ranked[:5]
 
     stocks_ws.clear()
-    stocks_ws.append_row(stocks_ws.row_values(1))
-    for s in final:
-        stocks_ws.append_row([s[0], s[1], s[2], "-", "-", "GENERIC", s[3], s[4]])
+    stocks_ws.append_row(["symbol","score","bucket","vol_ratio","squeeze"])
+    for r in final:
+        stocks_ws.append_row(list(r))
 
-    if not final:
-        send_msg("⚠️ *Risk-Off Day*\nNo deployable opportunities.", "riskoff")
-    else:
+    if final:
         msg = [f"🏛️ *Top Picks — {ist_today()}*", ""]
         for s in final:
             msg.append(f"• *{s[0]}* | {s[2]} | Vol {s[3]}x")
-        send_msg("\n".join(msg), "top_picks")
+        send_msg("\n".join(msg), "top_picks", state_map)
+    else:
+        send_msg("⚠️ *Risk-Off Day*\nNo deployable setups.", "riskoff", state_map)
 
     _write_state("last_morning_run", ist_today())
-    cleanup_history()
 
 # ==========================================================
 # EOD ENGINE
