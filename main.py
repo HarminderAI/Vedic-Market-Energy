@@ -157,72 +157,78 @@ def trend_health(df):
         return "UNKNOWN", 0.0
 
 def score_stock(df):
-    close = df["Close"].dropna()
-    volume = df["Volume"].dropna()
+    try:
+        close = df["Close"].dropna()
+        high = df["High"].dropna()
+        low = df["Low"].dropna()
+        volume = df["Volume"].dropna()
 
-    # -------- RSI (SAFE) --------
-    rsi_series = ta.rsi(close, length=14)
-    if rsi_series is None or rsi_series.dropna().empty:
-        rsi_val = 50
-    else:
-        rsi_val = rsi_series.dropna().iloc[-1]
+        if len(close) < 30 or len(volume) < 30:
+            return 0, 50, 1.0, False, False
 
-    # -------- TREND HEALTH --------
-    health, _ = trend_health(df)
+        # ---------------- RSI ----------------
+        rsi_series = ta.rsi(close, length=14)
+        rsi_val = rsi_series.dropna().iloc[-1] if rsi_series is not None and not rsi_series.dropna().empty else 50
 
-    # -------- VOLUME BREAKOUT --------
-    if len(volume) < 20:
-        vol_ratio = 1.0
-    else:
-        vol_sma = volume.rolling(20).mean()
-        avg_vol = vol_sma.iloc[-1]
-        vol_ratio = round(volume.iloc[-1] / avg_vol, 2) if avg_vol > 0 else 1.0
+        # ---------------- TREND HEALTH ----------------
+        health, _ = trend_health(df)
 
-    # -------- BOLLINGER + KELTNER (SQUEEZE) --------
-    is_squeezed = False
-    breakout_up = False
+        # ---------------- VOLUME BREAKOUT ----------------
+        vol_sma_series = volume.rolling(20).mean()
+        avg_vol = vol_sma_series.iloc[-1]
 
-    bb = ta.bbands(close, length=20, std=2)
-    kc = ta.kc(df["High"], df["Low"], close, length=20, scalar=1.5)
+        if pd.isna(avg_vol) or avg_vol <= 0:
+            vol_ratio = 1.0
+        else:
+            vol_ratio = round(volume.iloc[-1] / avg_vol, 2)
 
-    if bb is not None and kc is not None:
-        try:
-            upper_bb = bb["BBU_20_2.0"].iloc[-1]
-            lower_bb = bb["BBL_20_2.0"].iloc[-1]
-            upper_kc = kc["KCUe_20_1.5"].iloc[-1]
-            lower_kc = kc["KCLe_20_1.5"].iloc[-1]
+        # ---------------- BOLLINGER + KELTNER (SQUEEZE) ----------------
+        bb = ta.bbands(close, length=20, std=2)
+        kc = ta.kc(high, low, close, length=20, scalar=1.5)
 
-            is_squeezed = upper_bb < upper_kc and lower_bb > lower_kc
-            breakout_up = close.iloc[-1] > upper_bb
+        is_squeezed = False
+        breakout_up = False
 
-        except Exception:
-            pass
+        if bb is not None and kc is not None:
+            bb = bb.dropna()
+            kc = kc.dropna()
 
-    # -------- SCORING --------
-    score = 30 if rsi_val > 60 else 15 if rsi_val > 50 else 5
+            if not bb.empty and not kc.empty:
+                upper_bb = bb.iloc[-1]["BBU_20_2.0"]
+                lower_bb = bb.iloc[-1]["BBL_20_2.0"]
+                upper_kc = kc.iloc[-1]["KCUe_20_1.5"]
+                lower_kc = kc.iloc[-1]["KCLe_20_1.5"]
 
-    if health == "OVERSTRETCHED":
-        score -= 20
-    elif health == "HEALTHY":
-        score += 10
+                is_squeezed = upper_bb < upper_kc and lower_bb > lower_kc
 
-    # Volume confirmation
-    if vol_ratio >= 2.0:
-        score += 15
-    elif vol_ratio >= 1.5:
-        score += 10
+                # Breakout confirmation: price above upper BB
+                breakout_up = close.iloc[-1] > upper_bb
 
-    # Squeeze charging bonus
-    if is_squeezed:
-        score += 5
+        # ---------------- SCORE ENGINE ----------------
+        score = 30 if rsi_val > 60 else 15 if rsi_val > 50 else 5
 
-    return (
-        max(0, min(100, int(score))),
-        round(rsi_val, 1),
-        round(vol_ratio, 2),
-        is_squeezed,
-        breakout_up
-    )
+        if health == "OVERSTRETCHED":
+            score -= 20
+        elif health == "HEALTHY":
+            score += 10
+
+        # Volume bonus
+        if vol_ratio >= 2.0:
+            score += 15
+        elif vol_ratio >= 1.5:
+            score += 10
+
+        # Squeeze charging bonus
+        if is_squeezed:
+            score += 5
+
+        score = max(0, min(100, int(score)))
+
+        return score, int(rsi_val), vol_ratio, is_squeezed, breakout_up
+
+    except Exception as e:
+        print("Score error:", e)
+        return 0, 50, 1.0, False, False
 
 # ==========================================================
 # HISTORY CLEANUP (90 DAYS)
