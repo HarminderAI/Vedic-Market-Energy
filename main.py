@@ -131,6 +131,31 @@ def batch_download(tickers):
 # ==========================================================
 # INDICATORS
 # ==========================================================
+def trend_health(df):
+    try:
+        close = df["Close"].dropna()
+        if len(close) < 25:
+            return "UNKNOWN", 0.0
+
+        ema_series = ta.ema(close, length=20)
+        if ema_series is None or ema_series.dropna().empty:
+            return "UNKNOWN", 0.0
+
+        ema = ema_series.dropna().iloc[-1]
+        price = close.iloc[-1]
+
+        stretch = (price - ema) / ema * 100
+
+        if stretch > 4:
+            return "OVERSTRETCHED", round(stretch, 2)
+        if stretch < -2:
+            return "DEEP_PULLBACK", round(stretch, 2)
+
+        return "HEALTHY", round(stretch, 2)
+
+    except Exception:
+        return "UNKNOWN", 0.0
+
 def score_stock(df):
     close = df["Close"].dropna()
     volume = df["Volume"].dropna()
