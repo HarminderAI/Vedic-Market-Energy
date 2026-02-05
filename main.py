@@ -264,10 +264,10 @@ def morning_run():
     print("🚀 Starting Morning Run...")
     
     # Midnight Gate
-    now = ist_now()
-    if now.hour < 8:
-        print("💤 Too early. Sleeping until 8 AM.")
-        return
+    # now = ist_now()
+    # if now.hour < 8:
+        # print("💤 Too early. Sleeping until 8 AM.")
+       # return
 
     try:
         # 1. FETCH STATE & HISTORY
