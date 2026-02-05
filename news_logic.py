@@ -3,7 +3,6 @@
 # ==========================================================
 
 import os
-import time
 import requests
 import nltk
 from datetime import datetime, timedelta
@@ -12,18 +11,13 @@ from nltk.sentiment.vader import SentimentIntensityAnalyzer
 # ----------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # Must match Render env var
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # GNews API key
 NEWS_ENDPOINT = "https://gnews.io/api/v4/search"
 
 LANG = "en"
 COUNTRY = "in"
 MAX_ARTICLES = 10
 TIMEOUT = 10
-
-# Institutional sentiment thresholds (tightened)
-POSITIVE_THRESHOLD = 0.20
-NEGATIVE_THRESHOLD = -0.20
-HIGH_NOISE_THRESHOLD = 0.60
 
 # Sector keyword mapping
 SECTOR_KEYWORDS = {
@@ -36,30 +30,34 @@ SECTOR_KEYWORDS = {
 }
 
 # ----------------------------------------------------------
-# NLTK BOOTSTRAP (RENDER SAFE)
+# NLTK BOOTSTRAP (RENDER SAFE, ONE-TIME)
 # ----------------------------------------------------------
 def ensure_nltk():
     try:
         nltk.data.find("sentiment/vader_lexicon")
     except LookupError:
-        nltk.download("vader_lexicon")
+        nltk.download("vader_lexicon", quiet=True)
 
 ensure_nltk()
 SIA = SentimentIntensityAnalyzer()
 
 # ----------------------------------------------------------
-# CORE FETCH FUNCTION
+# FETCH & ANALYZE NEWS
 # ----------------------------------------------------------
 def fetch_market_news(hours_back=12):
     """
-    Fetches Indian market news and computes:
-    - overall sentiment (compound avg)
-    - noise (absolute compound avg)
-    - sector-wise sentiment
+    Returns:
+    {
+        overall: float,
+        noise: float,
+        sector_map: dict,
+        headlines: list
+    }
     """
 
+    # Fail-safe if API key missing
     if not NEWS_API_KEY:
-        return _empty_news()
+        return _neutral_news()
 
     from_time = (datetime.utcnow() - timedelta(hours=hours_back)).isoformat() + "Z"
 
@@ -74,10 +72,13 @@ def fetch_market_news(hours_back=12):
 
     try:
         resp = requests.get(NEWS_ENDPOINT, params=params, timeout=TIMEOUT)
-        resp.raise_for_status()
-        articles = resp.json().get("articles", [])
+        data = resp.json()
+        articles = data.get("articles", [])
     except Exception:
-        return _empty_news()
+        return _neutral_news()
+
+    if not articles:
+        return _neutral_news()
 
     compound_scores = []
     noise_scores = []
@@ -89,8 +90,8 @@ def fetch_market_news(hours_back=12):
         if not title:
             continue
 
-        sentiment = SIA.polarity_scores(title)
-        compound = sentiment["compound"]
+        scores = SIA.polarity_scores(title)
+        compound = scores["compound"]
 
         compound_scores.append(compound)
         noise_scores.append(abs(compound))
@@ -101,8 +102,8 @@ def fetch_market_news(hours_back=12):
             if any(k in lower for k in keys):
                 sector_scores[sector].append(compound)
 
-    overall = round(sum(compound_scores) / len(compound_scores), 3) if compound_scores else 0.0
-    noise = round(sum(noise_scores) / len(noise_scores), 3) if noise_scores else 0.0
+    overall = round(sum(compound_scores) / len(compound_scores), 3)
+    noise = round(sum(noise_scores) / len(noise_scores), 3)
 
     sector_map = {
         sector: round(sum(vals) / len(vals), 3)
@@ -118,51 +119,21 @@ def fetch_market_news(hours_back=12):
     }
 
 # ----------------------------------------------------------
-# SENTIMENT INTERPRETER (USED BY main.py)
-# ----------------------------------------------------------
-def analyze_news_sentiment(news):
-    overall = news.get("overall", 0.0)
-    noise = news.get("noise", 0.0)
-    sector_raw = news.get("sector_map", {})
-
-    if overall > POSITIVE_THRESHOLD:
-        bias = "POSITIVE"
-    elif overall < NEGATIVE_THRESHOLD:
-        bias = "NEGATIVE"
-    else:
-        bias = "NEUTRAL"
-
-    sector_bias = {}
-    for sector, score in sector_raw.items():
-        if score > POSITIVE_THRESHOLD:
-            sector_bias[sector] = "POSITIVE"
-        elif score < NEGATIVE_THRESHOLD:
-            sector_bias[sector] = "NEGATIVE"
-        else:
-            sector_bias[sector] = "NEUTRAL"
-
-    return {
-        "bias": bias,
-        "noise": noise,
-        "sector_bias": sector_bias,
-    }
-
-# ----------------------------------------------------------
-# TELEGRAM FORMATTER
+# FORMAT FOR TELEGRAM
 # ----------------------------------------------------------
 def format_news_block(news):
     overall = news["overall"]
     noise = news["noise"]
     headlines = news["headlines"]
 
-    if overall > POSITIVE_THRESHOLD:
+    if overall > 0.2:
         mood = "🟢 POSITIVE"
-    elif overall < NEGATIVE_THRESHOLD:
+    elif overall < -0.2:
         mood = "🔴 NEGATIVE"
     else:
         mood = "🟡 NEUTRAL"
 
-    noise_flag = "⚠️ HIGH NOISE" if noise > HIGH_NOISE_THRESHOLD else "✅ LOW NOISE"
+    noise_flag = "⚠️ HIGH NOISE" if noise > 0.6 else "✅ LOW NOISE"
 
     lines = [
         "📰 *Market Sentiment*",
@@ -178,9 +149,9 @@ def format_news_block(news):
     return "\n".join(lines)
 
 # ----------------------------------------------------------
-# FALLBACK
+# NEUTRAL FALLBACK
 # ----------------------------------------------------------
-def _empty_news():
+def _neutral_news():
     return {
         "overall": 0.0,
         "noise": 0.0,
