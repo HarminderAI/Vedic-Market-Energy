@@ -218,7 +218,13 @@ def score_stock(df):
 # ==========================================================
 def morning_run():
     state_rows = state_ws.get_all_records()
-    state_map = {r["key"]: r["value"] for r in state_rows}
+
+    state_map = {}
+    for r in state_rows:
+    k = r.get("key")
+    v = r.get("value")
+    if k and v:
+        state_map[k] = v
 
     if state_map.get("last_morning_run") == ist_today():
         return
