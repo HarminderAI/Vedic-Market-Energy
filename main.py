@@ -1,5 +1,5 @@
 # ==========================================================
-# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL PRODUCTION (v2.3)
+# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — HOTFIX (v2.4)
 # ==========================================================
 
 import os, json, time, datetime, threading, io
@@ -74,7 +74,7 @@ history_ws = safe_sheet("history", ["date","symbol","action","price","stop_loss"
 memory_ws = safe_sheet("memory", ["date", "squeezing_symbols_csv"])
 
 # ==========================================================
-# DATA ENGINE (HARDENED)
+# DATA ENGINE (HARDENED & DEDUPLICATED)
 # ==========================================================
 HARDCODED_FALLBACK = [
     "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
@@ -82,11 +82,11 @@ HARDCODED_FALLBACK = [
 ]
 
 def load_nifty_200_and_sectors():
-    """Returns symbol list and sector map with robust CSV handling and Anti-Bot Headers."""
+    """Returns symbol list and sector map with robust CSV handling."""
     try:
         url = "https://archives.nseindia.com/content/indices/ind_nifty200list.csv"
         
-        # 🛡️ FIX 1: Browser-Mimicking Headers (Bypasses NSE WAF)
+        # Browser-Mimicking Headers (Bypass NSE WAF)
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Referer": "https://www.nseindia.com/",
@@ -103,7 +103,6 @@ def load_nifty_200_and_sectors():
         symbol_col = next((c for c in df.columns if "Symbol" in c), "Symbol")
         
         if not industry_col:
-            # Fallback: Assume 3rd column is Industry if named weirdly
             industry_col = df.columns[2] if len(df.columns) > 2 else None
 
         df['Symbol'] = df[symbol_col] + ".NS"
@@ -122,19 +121,21 @@ def safe_download(symbol, days=100):
     # Retry Logic for Yahoo Flakiness
     for attempt in range(2):
         try:
-            # Random micro-throttle
             time.sleep(0.1 + (hash(symbol) % 10) / 100.0) 
             df = yf.download(symbol, period=f"{days}d", auto_adjust=True, progress=False)
             
             if df is None or df.empty: return None
             
-            # Flatten MultiIndex columns if present
+            # 🛡️ FIX 1: Flatten MultiIndex & Remove Duplicates
             if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0] for c in df.columns]
+                df.columns = df.columns.get_level_values(0)
+            
+            # Remove duplicate columns (e.g. two 'Close' columns)
+            df = df.loc[:, ~df.columns.duplicated()]
                 
             return df.dropna()
         except:
-            if attempt == 0: time.sleep(1) # Wait before retry
+            if attempt == 0: time.sleep(1)
             continue
     return None
 
@@ -149,7 +150,7 @@ def batch_download(symbols):
     return data
 
 # ==========================================================
-# SMART ANALYST ENGINE (FIXED LOGIC)
+# SMART ANALYST ENGINE (SCALAR SAFE)
 # ==========================================================
 def score_stock(df, was_squeezing):
     if len(df) < 50: return None
@@ -158,21 +159,28 @@ def score_stock(df, was_squeezing):
     high = df["High"]
     low = df["Low"]
     volume = df["Volume"]
-    price = close.iloc[-1]
 
-    # 1. Liquidity Floor
-    avg_vol = volume.rolling(20).mean().iloc[-1]
-    if avg_vol < MIN_VOL_FLOOR or price < MIN_PRICE:
+    # 🛡️ FIX 2: Force scalar float to prevent Series Ambiguity error
+    try:
+        price = float(close.iloc[-1])
+    except:
         return None
 
-    # 2. ATR & Risk Logic (NaN Fix)
+    # 1. Liquidity Floor
+    try:
+        avg_vol = float(volume.rolling(20).mean().iloc[-1])
+        if avg_vol < MIN_VOL_FLOOR or price < MIN_PRICE:
+            return None
+    except:
+        return None
+
+    # 2. ATR & Risk Logic
     atr = ta.atr(high, low, close, length=14)
     if atr is not None and not atr.dropna().empty:
-        current_atr = atr.dropna().iloc[-1]
+        current_atr = float(atr.dropna().iloc[-1])
     else:
-        current_atr = price * 0.02 # Fallback 2%
+        current_atr = price * 0.02
 
-    # Safety: Prevent zero ATR
     if current_atr < (price * 0.005): 
         current_atr = price * 0.005
 
@@ -191,7 +199,7 @@ def score_stock(df, was_squeezing):
 
     # Trend (EMA)
     ema = ta.ema(close, length=20)
-    ema_val = ema.dropna().iloc[-1] if ema is not None else price
+    ema_val = float(ema.dropna().iloc[-1]) if ema is not None else price
     stretch = (price - ema_val) / ema_val * 100
     
     if stretch > 5: score -= 15       
@@ -199,7 +207,7 @@ def score_stock(df, was_squeezing):
     elif stretch > 0: score += 25     
 
     # Volume
-    vol_ratio = round(volume.iloc[-1] / avg_vol, 2)
+    vol_ratio = round(float(volume.iloc[-1]) / avg_vol, 2)
     if vol_ratio >= 2.5: score += 20
     elif vol_ratio >= 1.5: score += 10
 
@@ -212,11 +220,10 @@ def score_stock(df, was_squeezing):
     
     if bb is not None and kc is not None:
         try:
-            # Deterministic Selection (No .item() crash)
-            bbu = bb.filter(like="BBU").iloc[-1, 0]
-            bbl = bb.filter(like="BBL").iloc[-1, 0]
-            kcu = kc.filter(like="KCU").iloc[-1, 0]
-            kcl = kc.filter(like="KCL").iloc[-1, 0]
+            bbu = float(bb.filter(like="BBU").iloc[-1, 0])
+            bbl = float(bb.filter(like="BBL").iloc[-1, 0])
+            kcu = float(kc.filter(like="KCU").iloc[-1, 0])
+            kcl = float(kc.filter(like="KCL").iloc[-1, 0])
 
             squeeze_now = (bbu < kcu) and (bbl > kcl)
             breakout = price > bbu
@@ -246,7 +253,7 @@ def score_stock(df, was_squeezing):
 def morning_run():
     print("🚀 Starting Morning Run...")
     
-    # 🛡️ FIX 2: Midnight Gate (Don't run before 8 AM IST)
+    # Midnight Gate
     now = ist_now()
     if now.hour < 8:
         print("💤 Too early. Sleeping until 8 AM.")
@@ -267,14 +274,13 @@ def morning_run():
         cutoff_date = (ist_now() - datetime.timedelta(days=30)).date()
         
         for row in hist_data[1:]:
-            # [date, symbol, action, ...]
             if len(row) > 1 and row[2] == "BUY": 
                 try:
                     entry_date = datetime.date.fromisoformat(row[0])
                     if entry_date >= cutoff_date:
                         open_positions.add(row[1])
                 except:
-                    pass # Ignore bad dates
+                    pass
 
         # Fetch Memory
         mem_rows = memory_ws.get_all_values()
@@ -347,7 +353,6 @@ def morning_run():
         r['bucket'] = bucket
         final_picks.append(r)
         
-        # Log Logic (Respects 30-day window)
         if "BUY" in bucket and r['symbol'] not in open_positions:
             new_log_rows.append([
                 ist_today(), 
@@ -414,10 +419,7 @@ if __name__ == "__main__":
         try:
             morning_run()
         except Exception as e:
-            # 🛡️ FIX 3: Anti-Death Spiral (15 min sleep on crash)
             print(f"💀 CRITICAL CRASH: {e}")
             send_msg(f"💀 Bot Crash Alert: {e}") 
-            time.sleep(900) 
-        
+            time.sleep(900)
         time.sleep(3600)
-        
