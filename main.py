@@ -1,8 +1,8 @@
 # ==========================================================
-# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL (2026 STABLE)
+# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL (2026 PROD)
 # ==========================================================
 
-import os, json, time, datetime
+import os, json, time, datetime, threading
 import requests, pytz
 import yfinance as yf
 import pandas as pd
@@ -16,15 +16,17 @@ from keep_alive import keep_alive
 from news_logic import fetch_market_news, format_news_block
 
 # ==========================================================
+# GLOBAL LOCK (THREAD SAFE)
+# ==========================================================
+msg_lock = threading.Lock()
+
+# ==========================================================
 # TIMEZONE
 # ==========================================================
 IST = pytz.timezone("Asia/Kolkata")
 
-def ist_now():
-    return datetime.datetime.now(IST)
-
 def ist_today():
-    return str(ist_now().date())
+    return datetime.datetime.now(IST).date().isoformat()
 
 # ==========================================================
 # CONFIG
@@ -37,27 +39,24 @@ SERVICE_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 GLOBAL_EXPOSURE_CAP = 0.90
 SECTOR_CAP = 0.50
 EXIT_SCORE_DROP = 15
-MAX_WORKERS = 5
+MAX_WORKERS = 6
 
 # ==========================================================
-# TELEGRAM
+# TELEGRAM (RAW)
 # ==========================================================
 def send_msg(text):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={
-                "chat_id": CHAT_ID,
-                "text": text,
-                "parse_mode": "Markdown"
-            },
-            timeout=10
-        )
-    except Exception as e:
-        print("Telegram error:", e)
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        data={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown"
+        },
+        timeout=10
+    )
 
 # ==========================================================
-# GOOGLE SHEETS — SAFE + IDEMPOTENT
+# GOOGLE SHEETS — SAFE CLIENT
 # ==========================================================
 def sheet_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -67,17 +66,17 @@ def sheet_client():
 gc = sheet_client()
 sheet = gc.open_by_key(GOOGLE_SHEET_ID)
 
-def safe_sheet(ws_name, headers):
+def safe_sheet(name, headers):
     global gc, sheet
     try:
-        return sheet.worksheet(ws_name)
+        return sheet.worksheet(name)
     except:
         gc = sheet_client()
         sheet = gc.open_by_key(GOOGLE_SHEET_ID)
         try:
-            return sheet.worksheet(ws_name)
+            return sheet.worksheet(name)
         except:
-            ws = sheet.add_worksheet(ws_name, rows=300, cols=len(headers))
+            ws = sheet.add_worksheet(name, rows=300, cols=len(headers))
             ws.append_row(headers)
             return ws
 
@@ -85,23 +84,36 @@ state_ws   = safe_sheet("state",   ["key","value"])
 stocks_ws  = safe_sheet("stocks",  ["symbol","score","bucket","size","health","sector"])
 history_ws = safe_sheet("history", ["date","symbol","event","detail"])
 
-def update_state(key, value):
-    """Idempotent state update (NO CLEAR EVER)"""
-    rows = state_ws.get_all_records()
-    for i, r in enumerate(rows, start=2):
-        if r.get("key") == key:
-            state_ws.update_cell(i, 2, value)
-            return
-    state_ws.append_row([key, value])
-
+# ==========================================================
+# STATE HELPERS (DEDUP CORE)
+# ==========================================================
 def read_state(key):
     for r in state_ws.get_all_records():
         if r.get("key") == key:
-            try:
-                return json.loads(r["value"])
-            except:
-                return None
+            return r.get("value")
     return None
+
+def write_state(key, value):
+    rows = state_ws.get_all_records()
+    for idx, r in enumerate(rows, start=2):
+        if r.get("key") == key:
+            state_ws.update_cell(idx, 2, value)
+            return
+    state_ws.append_row([key, value])
+
+def send_msg_deduped(text, key_id):
+    """
+    Prevents duplicate messages across:
+    - threads
+    - redeploys
+    - crashes
+    """
+    with msg_lock:
+        state_key = f"sent_{key_id}"
+        if read_state(state_key) == ist_today():
+            return
+        write_state(state_key, ist_today())
+        send_msg(text)
 
 # ==========================================================
 # MARKET DATA
@@ -118,11 +130,8 @@ def safe_download(ticker, days=80):
             return None
         if df.columns.nlevels > 1:
             df.columns = df.columns.get_level_values(0)
-        if "Close" not in df:
-            return None
         return df.dropna()
-    except Exception as e:
-        print(f"Download error {ticker}:", e)
+    except:
         return None
 
 def batch_download(tickers):
@@ -130,13 +139,9 @@ def batch_download(tickers):
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(safe_download, t): t for t in tickers}
         for f in as_completed(futures):
-            sym = futures[f]
-            try:
-                df = f.result()
-                if df is not None:
-                    out[sym] = df
-            except:
-                pass
+            df = f.result()
+            if df is not None:
+                out[futures[f]] = df
     return out
 
 # ==========================================================
@@ -145,35 +150,24 @@ def batch_download(tickers):
 def trend_health(df):
     close = df["Close"].dropna()
     if len(close) < 25:
-        return "UNKNOWN", 0.0
-
-    ema_series = ta.ema(close, length=20)
-    if ema_series is None or ema_series.dropna().empty:
-        return "UNKNOWN", 0.0
-
-    ema = ema_series.dropna().iloc[-1]
-    price = close.iloc[-1]
-    stretch = (price - ema) / ema * 100
-
-    if stretch > 4:
-        return "OVERSTRETCHED", round(stretch, 2)
-    if stretch < -2:
-        return "DEEP_PULLBACK", round(stretch, 2)
-    return "HEALTHY", round(stretch, 2)
+        return "UNKNOWN", 0
+    ema = ta.ema(close, 20)
+    if ema is None or ema.dropna().empty:
+        return "UNKNOWN", 0
+    ema = ema.dropna().iloc[-1]
+    stretch = (close.iloc[-1] - ema) / ema * 100
+    if stretch > 4: return "OVERSTRETCHED", round(stretch,2)
+    if stretch < -2: return "DEEP_PULLBACK", round(stretch,2)
+    return "HEALTHY", round(stretch,2)
 
 def score_stock(df):
-    rsi_series = ta.rsi(df["Close"], length=14)
+    rsi_series = ta.rsi(df["Close"], 14)
     rsi = rsi_series.dropna().iloc[-1] if rsi_series is not None and not rsi_series.dropna().empty else 50
-
     health, _ = trend_health(df)
-
     score = 30 if rsi > 60 else 15 if rsi > 50 else 5
-    if health == "OVERSTRETCHED":
-        score -= 20
-    elif health == "HEALTHY":
-        score += 10
-
-    return max(0, min(100, int(score))), health
+    if health == "OVERSTRETCHED": score -= 20
+    elif health == "HEALTHY": score += 10
+    return max(0,min(100,int(score))), health
 
 def assign_bucket(score):
     if score >= 80: return "STRONG_BUY"
@@ -185,12 +179,16 @@ def position_size(bucket):
     return {"STRONG_BUY":0.25,"BUY":0.15,"WATCHLIST":0.05}.get(bucket,0)
 
 # ==========================================================
-# MORNING ENGINE
+# MORNING ENGINE (DEDUP SAFE)
 # ==========================================================
 def morning_run():
-    send_msg("🌅 *Morning Scan Started*")
 
-    # ---- MACRO NEWS ----
+    if read_state("sent_morning_report") == ist_today():
+        return
+
+    send_msg_deduped("🌅 *Morning Scan Started*", "morning_report")
+
+    # --- NEWS ---
     news = fetch_market_news()
     send_msg(format_news_block(news))
 
@@ -202,15 +200,12 @@ def morning_run():
         "SUNPHARMA.NS":"PHARMA"
     }
 
-    prev_state = read_state("health_state") or {}
-    prev_health = prev_state.get("health", {})
-
     data = batch_download(STOCKS.keys())
     ranked = []
 
     for sym, df in data.items():
         score, health = score_stock(df)
-        if health == "HEALTHY" or (prev_health.get(sym) == "OVERSTRETCHED" and health == "HEALTHY"):
+        if health == "HEALTHY":
             ranked.append({
                 "symbol": sym,
                 "score": score,
@@ -221,7 +216,7 @@ def morning_run():
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
 
-    total_alloc = 0.0
+    total_alloc = 0
     sector_alloc = defaultdict(float)
     final = []
 
@@ -229,24 +224,13 @@ def morning_run():
         if len(final) == 5:
             break
         size = position_size(s["bucket"])
-        if size == 0:
-            continue
-        if total_alloc + size > GLOBAL_EXPOSURE_CAP:
-            continue
-        if sector_alloc[s["sector"]] + size > SECTOR_CAP:
-            send_msg(f"⚠️ Sector Concentration Alert: {s['sector']}")
-            continue
-
+        if size == 0: continue
+        if total_alloc + size > GLOBAL_EXPOSURE_CAP: continue
+        if sector_alloc[s["sector"]] + size > SECTOR_CAP: continue
         total_alloc += size
         sector_alloc[s["sector"]] += size
-        s["size"] = round(size * 100, 1)
+        s["size"] = round(size*100,1)
         final.append(s)
-
-    # ---- SAVE HEALTH STATE (NO CLEAR) ----
-    update_state(
-        "health_state",
-        json.dumps({"date": ist_today(), "health": {s["symbol"]: s["health"] for s in ranked}})
-    )
 
     stocks_ws.clear()
     stocks_ws.append_row(["symbol","score","bucket","size","health","sector"])
@@ -254,7 +238,7 @@ def morning_run():
         stocks_ws.append_row([s[k] for k in ["symbol","score","bucket","size","health","sector"]])
 
     if not final:
-        send_msg("⚠️ *Risk-Off Day*\n💤 No deployable opportunities. Capital preserved.")
+        send_msg("⚠️ *Risk-Off Day*\n💤 Capital preserved.")
         return
 
     msg = [f"🏛️ *Top Picks — {ist_today()}*", ""]
@@ -263,10 +247,14 @@ def morning_run():
     send_msg("\n".join(msg))
 
 # ==========================================================
-# EOD ENGINE
+# EOD ENGINE (DEDUP SAFE)
 # ==========================================================
 def eod_run():
-    send_msg("📊 *EOD Analytics Ready*")
+
+    if read_state("sent_eod_report") == ist_today():
+        return
+
+    send_msg_deduped("📊 *EOD Analytics Ready*", "eod_report")
 
     prev = {r["symbol"]: int(r["score"]) for r in stocks_ws.get_all_records()}
     if not prev:
