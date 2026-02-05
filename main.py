@@ -264,19 +264,19 @@ def morning_run():
     print("🚀 Starting Morning Run...")
     
     # Midnight Gate
-    #now = ist_now()
-    #if now.hour < 8:
-        #print("💤 Too early. Sleeping until 8 AM.")
-        #return
+    now = ist_now()
+    if now.hour < 8:
+        print("💤 Too early. Sleeping until 8 AM.")
+        return
 
     try:
         # 1. FETCH STATE & HISTORY
         raw_state = state_ws.get_all_records()
         state_map = {r["key"]: r["value"] for r in raw_state}
         
-        #if state_map.get(STATE_RUN_KEY) == ist_today():
-            #print("✅ Already ran today.")
-            #return
+        if state_map.get(STATE_RUN_KEY) == ist_today():
+            print("✅ Already ran today.")
+            return
 
         # Smart History Check (30 Day Window)
         hist_data = history_ws.get_all_values()
