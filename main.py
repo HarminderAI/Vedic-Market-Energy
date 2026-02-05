@@ -1,5 +1,5 @@
 # ==========================================================
-# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — PRODUCTION (STABLE)
+# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — PROFESSIONAL (ATR)
 # ==========================================================
 
 import os, json, time, datetime, threading, io
@@ -34,10 +34,9 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SERVICE_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 
 MAX_WORKERS = 5
-BASE_GLOBAL_EXPOSURE = 0.9
 
 # ==========================================================
-# TELEGRAM (DEDUP SAFE)
+# TELEGRAM
 # ==========================================================
 msg_lock = threading.Lock()
 
@@ -74,8 +73,8 @@ def safe_sheet(name, headers):
         return ws
 
 state_ws  = safe_sheet("state", ["key", "value"])
-stocks_ws = safe_sheet("stocks", ["symbol","score","bucket","vol_ratio","squeeze"])
-history_ws = safe_sheet("history", ["date","symbol","event","detail"])
+# ADDED HEADERS: stop_loss, target
+stocks_ws = safe_sheet("stocks", ["symbol","score","bucket","vol_ratio","stop_loss","target"])
 
 def _write_state(key, value):
     rows = state_ws.get_all_records()
@@ -86,10 +85,11 @@ def _write_state(key, value):
     state_ws.append_row([key, value])
 
 # ==========================================================
-# UNIVERSE (WITH FALLBACK)
+# UNIVERSE
 # ==========================================================
 HARDCODED_FALLBACK = [
-    "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS"
+    "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
+    "SBIN.NS","BHARTIARTL.NS","ITC.NS","KOTAKBANK.NS","LT.NS"
 ]
 
 def load_nifty_200():
@@ -102,7 +102,7 @@ def load_nifty_200():
         return HARDCODED_FALLBACK
 
 # ==========================================================
-# MARKET DATA (MICRO-THROTTLED)
+# DATA ENGINE
 # ==========================================================
 def safe_download(symbol, days=90):
     try:
@@ -126,22 +126,19 @@ def batch_download(symbols):
     return data
 
 # ==========================================================
-# INDICATORS
+# SMART ANALYST ENGINE (ATR + SQUEEZE)
 # ==========================================================
 def trend_health(df):
     close = df["Close"]
     ema = ta.ema(close, length=20)
-    if ema is None or ema.dropna().empty:
-        return "UNKNOWN"
-
+    if ema is None or ema.dropna().empty: return "UNKNOWN"
+    
     price = close.iloc[-1]
     ema_val = ema.dropna().iloc[-1]
     stretch = (price - ema_val) / ema_val * 100
-
-    if stretch > 4:
-        return "OVERSTRETCHED"
-    if stretch < -2:
-        return "DEEP_PULLBACK"
+    
+    if stretch > 4: return "OVERSTRETCHED"
+    if stretch < -2: return "DEEP_PULLBACK"
     return "HEALTHY"
 
 def score_stock(df):
@@ -151,42 +148,41 @@ def score_stock(df):
     volume = df["Volume"]
 
     if len(close) < 30:
-        return 0, 50, 1.0, False, False
+        return 0, 1.0, False, False, 0.0, 0.0
 
+    # 1. CALCULATE ATR FOR TARGETS
+    atr = ta.atr(high, low, close, length=14)
+    current_atr = atr.dropna().iloc[-1] if atr is not None else 0
+    current_price = close.iloc[-1]
+    
+    # Logic: Risk 1 Unit (2x ATR), Reward 2 Units (4x ATR)
+    stop_loss = round(current_price - (2 * current_atr), 1)
+    target_price = round(current_price + (4 * current_atr), 1)
+
+    # 2. SCORING
     score = 0
-
+    
     # RSI
     rsi = ta.rsi(close, length=14)
     rsi_val = int(rsi.dropna().iloc[-1]) if rsi is not None else 50
-
-    if rsi_val >= 70:
-        score += 30
-    elif rsi_val >= 60:
-        score += 22
-    elif rsi_val >= 50:
-        score += 12
+    if rsi_val >= 70: score += 30
+    elif rsi_val >= 60: score += 22
+    elif rsi_val >= 50: score += 12
 
     # Trend
     health = trend_health(df)
-    if health == "HEALTHY":
-        score += 25
-    elif health == "DEEP_PULLBACK":
-        score += 10
-    elif health == "OVERSTRETCHED":
-        score -= 15
+    if health == "HEALTHY": score += 25
+    elif health == "DEEP_PULLBACK": score += 10
+    elif health == "OVERSTRETCHED": score -= 15
 
     # Volume
     avg_vol = volume.rolling(20).mean().iloc[-1]
     vol_ratio = round(volume.iloc[-1] / avg_vol, 2) if avg_vol > 0 else 1.0
+    if vol_ratio >= 2.5: score += 20
+    elif vol_ratio >= 2.0: score += 15
+    elif vol_ratio >= 1.5: score += 8
 
-    if vol_ratio >= 2.5:
-        score += 20
-    elif vol_ratio >= 2.0:
-        score += 15
-    elif vol_ratio >= 1.5:
-        score += 8
-
-    # Volatility (CORRECT PARAMETERS)
+    # Squeeze & Breakout
     bb = ta.bbands(close, length=20, std=2)
     kc = ta.kc(high, low, close, length=20, scalar=1.5)
 
@@ -200,18 +196,16 @@ def score_stock(df):
         lower_kc = kc.filter(like="KCL").iloc[-1, 0]
 
         squeeze = upper_bb < upper_kc and lower_bb > lower_kc
-        if squeeze:
-            score += 10
-
-        if close.iloc[-1] > upper_bb:
+        if squeeze: score += 10
+        if close.iloc[-1] > upper_bb: 
             breakout = True
             score += 10
 
     score = max(0, min(100, score))
-    return score, rsi_val, vol_ratio, squeeze, breakout
+    return score, vol_ratio, squeeze, breakout, stop_loss, target_price
 
 # ==========================================================
-# MORNING ENGINE (WITH WATCHLIST)
+# MORNING RUN
 # ==========================================================
 def morning_run():
     state_rows = state_ws.get_all_records()
@@ -221,45 +215,65 @@ def morning_run():
         return
 
     send_msg("🌅 *Morning Scan Started*", "morning_start", state_map)
-
+    
     news = fetch_market_news()
     send_msg(format_news_block(news), "news", state_map)
 
     universe = load_nifty_200()
     data = batch_download(universe)
 
-    buys, watchlist = [], []
+    buys = []
+    watchlist = []
 
     for sym, df in data.items():
-        score, rsi, vol_ratio, squeeze, breakout = score_stock(df)
+        score, vol, squeeze, breakout, sl, tgt = score_stock(df)
 
+        # Filters
         if score >= 80 and breakout:
-            buys.append((sym, score, "STRONG_BUY", vol_ratio, squeeze))
+            buys.append({
+                "symbol": sym, "score": score, "bucket": "STRONG_BUY",
+                "vol": vol, "sl": sl, "tgt": tgt
+            })
         elif score >= 65:
-            buys.append((sym, score, "BUY", vol_ratio, squeeze))
+            buys.append({
+                "symbol": sym, "score": score, "bucket": "BUY",
+                "vol": vol, "sl": sl, "tgt": tgt
+            })
         elif score >= 55:
-            watchlist.append((sym, score, vol_ratio))
+            watchlist.append({
+                "symbol": sym, "score": score, "vol": vol
+            })
 
+    # Save to Sheets
     stocks_ws.clear()
-    stocks_ws.append_row(["symbol","score","bucket","vol_ratio","squeeze"])
-
+    stocks_ws.append_row(["symbol","score","bucket","vol_ratio","stop_loss","target"])
     for s in buys:
-        stocks_ws.append_row([s[0], s[1], s[2], s[3], s[4]])
+        stocks_ws.append_row([s["symbol"], s["score"], s["bucket"], s["vol"], s["sl"], s["tgt"]])
 
+    # Telegram Message: STRONG BUYS
     if buys:
-        msg = ["🏛️ *Deployable Opportunities*", ""]
+        msg = ["🏛️ *Actionable Setups*", ""]
+        # Sort by score
+        buys.sort(key=lambda x: x["score"], reverse=True)
+        
         for s in buys[:5]:
-            msg.append(f"• *{s[0]}* | {s[2]} | Score {s[1]}")
+            icon = "🚀" if s["bucket"] == "STRONG_BUY" else "✅"
+            msg.append(f"{icon} *{s['symbol']}* (Score {s['score']})")
+            msg.append(f"   Vol: {s['vol']}x | 🎯 {s['tgt']} | 🛑 {s['sl']}")
+            msg.append("") # spacer
+            
         send_msg("\n".join(msg), "deployables", state_map)
 
+    # Telegram Message: WATCHLIST
     if watchlist:
-        msg = ["👀 *Pre-Breakout Watchlist*", ""]
+        msg = ["👀 *Watchlist (Wait for Breakout)*", ""]
+        watchlist.sort(key=lambda x: x["score"], reverse=True)
         for s in watchlist[:5]:
-            msg.append(f"• *{s[0]}* | Score {s[1]} | Vol {s[2]}x")
+            msg.append(f"• *{s['symbol']}* | Score {s['score']} | Vol {s['vol']}x")
         send_msg("\n".join(msg), "watchlist", state_map)
 
     if not buys and not watchlist:
-        send_msg("⚠️ *Risk-Off Day*\nNo quality setups today.", "riskoff", state_map)
+        send_msg("⚠️ *Risk-Off Day*\nNo institutional setups found.", "riskoff", state_map)
 
     _write_state("last_morning_run", ist_today())
 
@@ -271,3 +285,4 @@ if __name__ == "__main__":
     morning_run()
     while True:
         time.sleep(3600)
+    
