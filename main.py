@@ -132,30 +132,72 @@ def batch_download(tickers):
 # INDICATORS
 # ==========================================================
 def score_stock(df):
-    close = df["Close"]
-    rsi = ta.rsi(close, length=14).dropna()
-    rsi_val = rsi.iloc[-1] if not rsi.empty else 50
+    close = df["Close"].dropna()
+    volume = df["Volume"].dropna()
 
-    vol_sma = df["Volume"].rolling(20).mean()
-    vol_ratio = round(df["Volume"].iloc[-1] / vol_sma.iloc[-1], 2)
+    # -------- RSI (SAFE) --------
+    rsi_series = ta.rsi(close, length=14)
+    if rsi_series is None or rsi_series.dropna().empty:
+        rsi_val = 50
+    else:
+        rsi_val = rsi_series.dropna().iloc[-1]
+
+    # -------- TREND HEALTH --------
+    health, _ = trend_health(df)
+
+    # -------- VOLUME BREAKOUT --------
+    if len(volume) < 20:
+        vol_ratio = 1.0
+    else:
+        vol_sma = volume.rolling(20).mean()
+        avg_vol = vol_sma.iloc[-1]
+        vol_ratio = round(volume.iloc[-1] / avg_vol, 2) if avg_vol > 0 else 1.0
+
+    # -------- BOLLINGER + KELTNER (SQUEEZE) --------
+    is_squeezed = False
+    breakout_up = False
 
     bb = ta.bbands(close, length=20, std=2)
     kc = ta.kc(df["High"], df["Low"], close, length=20, scalar=1.5)
 
-    squeeze = (
-        bb.iloc[-1]["BBU_20_2.0"] < kc.iloc[-1]["KCUe_20_1.5"] and
-        bb.iloc[-1]["BBL_20_2.0"] > kc.iloc[-1]["KCLe_20_1.5"]
-    )
+    if bb is not None and kc is not None:
+        try:
+            upper_bb = bb["BBU_20_2.0"].iloc[-1]
+            lower_bb = bb["BBL_20_2.0"].iloc[-1]
+            upper_kc = kc["KCUe_20_1.5"].iloc[-1]
+            lower_kc = kc["KCLe_20_1.5"].iloc[-1]
 
-    upper_bb = bb.iloc[-1]["BBU_20_2.0"]
-    breakout_up = close.iloc[-1] > upper_bb
+            is_squeezed = upper_bb < upper_kc and lower_bb > lower_kc
+            breakout_up = close.iloc[-1] > upper_bb
 
+        except Exception:
+            pass
+
+    # -------- SCORING --------
     score = 30 if rsi_val > 60 else 15 if rsi_val > 50 else 5
-    if vol_ratio >= 2.0: score += 15
-    elif vol_ratio >= 1.5: score += 10
-    if squeeze: score += 5
 
-    return score, rsi_val, vol_ratio, squeeze, breakout_up
+    if health == "OVERSTRETCHED":
+        score -= 20
+    elif health == "HEALTHY":
+        score += 10
+
+    # Volume confirmation
+    if vol_ratio >= 2.0:
+        score += 15
+    elif vol_ratio >= 1.5:
+        score += 10
+
+    # Squeeze charging bonus
+    if is_squeezed:
+        score += 5
+
+    return (
+        max(0, min(100, int(score))),
+        round(rsi_val, 1),
+        round(vol_ratio, 2),
+        is_squeezed,
+        breakout_up
+    )
 
 # ==========================================================
 # HISTORY CLEANUP (90 DAYS)
