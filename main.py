@@ -274,9 +274,9 @@ def morning_run():
         raw_state = state_ws.get_all_records()
         state_map = {r["key"]: r["value"] for r in raw_state}
         
-        if state_map.get(STATE_RUN_KEY) == ist_today():
-            print("✅ Already ran today.")
-            return
+       # if state_map.get(STATE_RUN_KEY) == ist_today():
+         #   print("✅ Already ran today.")
+          #  return
 
         # Smart History Check (30 Day Window)
         hist_data = history_ws.get_all_values()
