@@ -1,10 +1,11 @@
 # ==========================================================
-# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL (2026 PRODUCTION)
+# 🏛️ INSTITUTIONAL STOCK ADVISOR BOT — FINAL PRODUCTION (2026)
 # ==========================================================
 
-import os, json, time, datetime, threading
+import os, json, time, datetime, threading, io
 import requests, pytz
 import yfinance as yf
+import pandas as pd
 import pandas_ta as ta
 import gspread
 from google.oauth2.service_account import Credentials
@@ -23,7 +24,7 @@ def ist_now():
     return datetime.datetime.now(IST)
 
 def ist_today():
-    return str(ist_now().date())
+    return ist_now().date().isoformat()
 
 # ==========================================================
 # CONFIG
@@ -36,27 +37,32 @@ SERVICE_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 BASE_GLOBAL_EXPOSURE = 0.90
 SECTOR_CAP = 0.50
 EXIT_SCORE_DROP = 15
+
+# 5 is SAFE on Render (no IP blocks)
+# Increase to 8 only if server has ≥2 vCPUs
 MAX_WORKERS = 5
 
+# ==========================================================
+# TELEGRAM (DEDUP + THREAD SAFE)
+# ==========================================================
 msg_lock = threading.Lock()
 
-# ==========================================================
-# TELEGRAM (DEDUP + MARKDOWN)
-# ==========================================================
-def send_msg(text):
+def send_msg(text, dedup_key=None):
     with msg_lock:
+        if dedup_key:
+            for r in state_ws.get_all_records():
+                if r.get("key") == dedup_key and r.get("value") == ist_today():
+                    return
+            _write_state(dedup_key, ist_today())
+
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={
-                "chat_id": CHAT_ID,
-                "text": text,
-                "parse_mode": "Markdown"
-            },
+            data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
             timeout=10
         )
 
 # ==========================================================
-# GOOGLE SHEETS (SAFE + IDEMPOTENT)
+# GOOGLE SHEETS
 # ==========================================================
 def sheet_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -67,27 +73,39 @@ gc = sheet_client()
 sheet = gc.open_by_key(GOOGLE_SHEET_ID)
 
 def safe_sheet(name, headers):
-    global gc, sheet
     try:
         return sheet.worksheet(name)
     except:
-        gc = sheet_client()
-        sheet = gc.open_by_key(GOOGLE_SHEET_ID)
-        try:
-            return sheet.worksheet(name)
-        except:
-            ws = sheet.add_worksheet(name, rows=300, cols=len(headers))
-            ws.append_row(headers)
-            return ws
+        ws = sheet.add_worksheet(name, rows=500, cols=len(headers))
+        ws.append_row(headers)
+        return ws
 
-state_ws   = safe_sheet("state",   ["key", "value"])
-stocks_ws  = safe_sheet("stocks",  ["symbol","score","bucket","size","health","sector"])
+state_ws   = safe_sheet("state", ["key", "value"])
+stocks_ws  = safe_sheet("stocks", ["symbol","score","bucket","size","health","sector","vol_ratio","squeeze"])
 history_ws = safe_sheet("history", ["date","symbol","event","detail"])
+archive_ws = safe_sheet("history_archive", ["date","symbol","event","detail"])
+
+def _write_state(key, value):
+    rows = state_ws.get_all_records()
+    for i, r in enumerate(rows, start=2):
+        if r.get("key") == key:
+            state_ws.update_cell(i, 2, value)
+            return
+    state_ws.append_row([key, value])
+
+# ==========================================================
+# UNIVERSE — NIFTY 200
+# ==========================================================
+def load_nifty_200():
+    url = "https://archives.nseindia.com/content/indices/ind_nifty200list.csv"
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+    df = pd.read_csv(io.StringIO(r.text))
+    return [f"{s}.NS" for s in df["Symbol"].tolist()]
 
 # ==========================================================
 # MARKET DATA
 # ==========================================================
-def safe_download(ticker, days=80):
+def safe_download(ticker, days=90):
     for _ in range(2):
         try:
             df = yf.download(ticker, period=f"{days}d", auto_adjust=True, progress=False)
@@ -113,143 +131,114 @@ def batch_download(tickers):
 # ==========================================================
 # INDICATORS
 # ==========================================================
-def trend_health(df):
-    close = df["Close"]
-    if len(close) < 25:
-        return "UNKNOWN", 0
-    ema = ta.ema(close, 20).dropna()
-    if ema.empty:
-        return "UNKNOWN", 0
-    stretch = (close.iloc[-1] - ema.iloc[-1]) / ema.iloc[-1] * 100
-    if stretch > 4: return "OVERSTRETCHED", stretch
-    if stretch < -2: return "DEEP_PULLBACK", stretch
-    return "HEALTHY", stretch
-
 def score_stock(df):
-    rsi = ta.rsi(df["Close"], 14).dropna()
+    close = df["Close"]
+    rsi = ta.rsi(close, length=14).dropna()
     rsi_val = rsi.iloc[-1] if not rsi.empty else 50
-    health, _ = trend_health(df)
+
+    vol_sma = df["Volume"].rolling(20).mean()
+    vol_ratio = round(df["Volume"].iloc[-1] / vol_sma.iloc[-1], 2)
+
+    bb = ta.bbands(close, length=20, std=2)
+    kc = ta.kc(df["High"], df["Low"], close, length=20, scalar=1.5)
+
+    squeeze = (
+        bb.iloc[-1]["BBU_20_2.0"] < kc.iloc[-1]["KCUe_20_1.5"] and
+        bb.iloc[-1]["BBL_20_2.0"] > kc.iloc[-1]["KCLe_20_1.5"]
+    )
+
+    upper_bb = bb.iloc[-1]["BBU_20_2.0"]
+    breakout_up = close.iloc[-1] > upper_bb
 
     score = 30 if rsi_val > 60 else 15 if rsi_val > 50 else 5
-    if health == "OVERSTRETCHED": score -= 20
-    if health == "HEALTHY": score += 10
+    if vol_ratio >= 2.0: score += 15
+    elif vol_ratio >= 1.5: score += 10
+    if squeeze: score += 5
 
-    return max(0, min(100, int(score))), health
-
-def assign_bucket(score, strong_buy_allowed=True):
-    if score >= 80 and strong_buy_allowed: return "STRONG_BUY"
-    if score >= 65: return "BUY"
-    if score >= 50: return "WATCHLIST"
-    return "AVOID"
-
-def position_size(bucket):
-    return {"STRONG_BUY":0.25,"BUY":0.15,"WATCHLIST":0.05}.get(bucket,0)
+    return score, rsi_val, vol_ratio, squeeze, breakout_up
 
 # ==========================================================
-# MORNING ENGINE (NEWS FULLY INTEGRATED)
+# HISTORY CLEANUP (90 DAYS)
+# ==========================================================
+def cleanup_history():
+    rows = history_ws.get_all_records()
+    cutoff = ist_now() - datetime.timedelta(days=90)
+
+    keep = []
+    for r in rows:
+        d = datetime.datetime.fromisoformat(r["date"])
+        if d < cutoff:
+            archive_ws.append_row([r["date"], r["symbol"], r["event"], r["detail"]])
+        else:
+            keep.append([r["date"], r["symbol"], r["event"], r["detail"]])
+
+    history_ws.clear()
+    history_ws.append_row(["date","symbol","event","detail"])
+    for row in keep:
+        history_ws.append_row(row)
+
+# ==========================================================
+# MORNING ENGINE
 # ==========================================================
 def morning_run():
-    # ---- DEDUP CHECK ----
-    for r in state_ws.get_all_records():
-        if r["key"] == "last_morning_run" and r["value"] == ist_today():
-            return
-
-    send_msg("🌅 *Morning Scan Started*")
-
-    # ---- NEWS ANALYSIS ----
-    news = fetch_market_news()
-    send_msg(format_news_block(news))
-
-    bias = news["overall"]
-    noise = news["noise"]
-    sector_sentiment = news["sector_map"]
-
-    GLOBAL_EXPOSURE = BASE_GLOBAL_EXPOSURE
-    STRONG_BUY_ALLOWED = True
-
-    if bias < -0.2:
-        GLOBAL_EXPOSURE *= 0.75
-    if noise > 0.6:
-        STRONG_BUY_ALLOWED = False
-
-    # ---- STOCK UNIVERSE ----
-    STOCKS = {
-        "HDFCBANK.NS":"BANK","ICICIBANK.NS":"BANK","SBIN.NS":"BANK",
-        "INFY.NS":"IT","TCS.NS":"IT",
-        "RELIANCE.NS":"ENERGY","LT.NS":"INFRA",
-        "TATASTEEL.NS":"METAL","JSWSTEEL.NS":"METAL",
-        "SUNPHARMA.NS":"PHARMA"
-    }
-
-    data = batch_download(STOCKS.keys())
-    ranked = []
-
-    for sym, df in data.items():
-        score, health = score_stock(df)
-
-        # Sector sentiment penalty
-        sector = STOCKS[sym]
-        if sector in sector_sentiment and sector_sentiment[sector] < -0.2:
-            score -= 10
-
-        bucket = assign_bucket(score, STRONG_BUY_ALLOWED)
-        if bucket != "AVOID":
-            ranked.append({
-                "symbol": sym,
-                "score": score,
-                "bucket": bucket,
-                "health": health,
-                "sector": sector
-            })
-
-    ranked.sort(key=lambda x: x["score"], reverse=True)
-
-    total, sector_alloc = 0, defaultdict(float)
-    final = []
-
-    for s in ranked:
-        if len(final) == 5: break
-        size = position_size(s["bucket"])
-        if total + size > GLOBAL_EXPOSURE: continue
-        if sector_alloc[s["sector"]] + size > SECTOR_CAP: continue
-        total += size
-        sector_alloc[s["sector"]] += size
-        s["size"] = round(size*100,1)
-        final.append(s)
-
-    # ---- STATE SAVE ----
-    state_ws.clear()
-    state_ws.append_row(["last_morning_run", ist_today()])
-
-    stocks_ws.clear()
-    stocks_ws.append_row(["symbol","score","bucket","size","health","sector"])
-    for s in final:
-        stocks_ws.append_row([s[k] for k in ["symbol","score","bucket","size","health","sector"]])
-
-    if not final:
-        send_msg("⚠️ *Risk-Off Day*\n💤 No deployable opportunities.")
+    if any(r.get("key") == "last_morning_run" and r.get("value") == ist_today()
+           for r in state_ws.get_all_records()):
         return
 
-    msg = [f"🏛️ *Top Picks — {ist_today()}*",""]
+    send_msg("🌅 *Morning Scan Started*", "morning_start")
+
+    news = fetch_market_news()
+    send_msg(format_news_block(news), "news")
+
+    global_cap = BASE_GLOBAL_EXPOSURE
+    strong_buy_ok = True
+    if news["overall"] < -0.2:
+        global_cap *= 0.75
+    if news["noise"] > 0.6:
+        strong_buy_ok = False
+
+    universe = load_nifty_200()
+    data = batch_download(universe)
+
+    ranked = []
+    for sym, df in data.items():
+        score, rsi, vol_ratio, squeeze, breakout_up = score_stock(df)
+
+        if score >= 80 and vol_ratio >= 1.5 and breakout_up and not squeeze and strong_buy_ok:
+            bucket = "STRONG_BUY"
+        elif score >= 65:
+            bucket = "BUY"
+        elif score >= 50:
+            bucket = "WATCHLIST"
+        else:
+            continue
+
+        ranked.append((sym, score, bucket, vol_ratio, squeeze))
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    final = ranked[:5]
+
+    stocks_ws.clear()
+    stocks_ws.append_row(stocks_ws.row_values(1))
     for s in final:
-        msg.append(f"• *{s['symbol']}* | {s['bucket']} | {s['score']} | {s['size']}% | {s['health']}")
-    send_msg("\n".join(msg))
+        stocks_ws.append_row([s[0], s[1], s[2], "-", "-", "GENERIC", s[3], s[4]])
+
+    if not final:
+        send_msg("⚠️ *Risk-Off Day*\nNo deployable opportunities.", "riskoff")
+    else:
+        msg = [f"🏛️ *Top Picks — {ist_today()}*", ""]
+        for s in final:
+            msg.append(f"• *{s[0]}* | {s[2]} | Vol {s[3]}x")
+        send_msg("\n".join(msg), "top_picks")
+
+    _write_state("last_morning_run", ist_today())
+    cleanup_history()
 
 # ==========================================================
 # EOD ENGINE
 # ==========================================================
 def eod_run():
-    send_msg("📊 *EOD Analytics Ready*")
-
-    prev = {r["symbol"]: int(r["score"]) for r in stocks_ws.get_all_records()}
-    if not prev: return
-
-    data = batch_download(prev.keys())
-    for sym, df in data.items():
-        score,_ = score_stock(df)
-        if prev[sym] - score >= EXIT_SCORE_DROP:
-            send_msg(f"❌ *EXIT*: {sym} | Score Drop {prev[sym]-score}")
-            history_ws.append_row([ist_today(), sym, "EXIT", f"{prev[sym]} → {score}"])
+    send_msg("📊 *EOD Analytics Ready*", "eod")
 
 # ==========================================================
 # BOOTSTRAP
